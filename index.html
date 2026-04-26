@@ -1,0 +1,1152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SpaceInn — Find Your Perfect Space</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, addDoc, getDocs, query, where, orderBy, doc, updateDoc, deleteDoc, serverTimestamp, Timestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBLD-z9z2Le8DAqYobMkd2kwurgI9B69rY",
+  authDomain: "sales-genius-a.firebaseapp.com",
+  projectId: "sales-genius-a",
+  storageBucket: "sales-genius-a.firebasestorage.app",
+  messagingSenderId: "443916526137",
+  appId: "1:443916526137:web:87f76fa73b0a578b17a3e8",
+  measurementId: "G-M9C615D3J5"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const storage = getStorage(app);
+const googleProvider = new GoogleAuthProvider();
+
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let currentUser = null;
+let currentView = 'home';
+let allListings = [];
+let selectedListing = null;
+let uploadedImageURLs = [];
+let filterType = 'all';
+let searchQuery = '';
+
+// ─── AUTH STATE ───────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  currentUser = user;
+  updateNavAuth();
+  if (currentView === 'dashboard') renderDashboard();
+});
+
+// ─── NAVIGATION ───────────────────────────────────────────────────────────────
+window.navigate = function(view, data = null) {
+  currentView = view;
+  if (data) selectedListing = data;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const page = document.getElementById('page-' + view);
+  if (page) {
+    page.classList.add('active');
+    page.scrollTop = 0;
+  }
+  if (view === 'home') loadListings();
+  if (view === 'dashboard') renderDashboard();
+  if (view === 'listing' && selectedListing) renderListingDetail();
+  setTimeout(() => lucide.createIcons(), 50);
+};
+
+function updateNavAuth() {
+  const navAuthArea = document.getElementById('nav-auth-area');
+  if (!navAuthArea) return;
+  if (currentUser) {
+    const name = currentUser.displayName || currentUser.email.split('@')[0];
+    navAuthArea.innerHTML = `
+      <div class="nav-user">
+        <div class="avatar-bubble">${name[0].toUpperCase()}</div>
+        <span class="user-name">${name}</span>
+        <button class="neo-btn-sm" onclick="navigate('dashboard')"><i data-lucide="layout-dashboard" style="width:14px;height:14px"></i> Dashboard</button>
+        <button class="neo-btn-sm danger" onclick="handleSignOut()"><i data-lucide="log-out" style="width:14px;height:14px"></i></button>
+      </div>`;
+  } else {
+    navAuthArea.innerHTML = `
+      <button class="neo-btn-sm" onclick="showModal('auth-modal')"><i data-lucide="user" style="width:14px;height:14px"></i> Sign In</button>
+      <button class="neo-btn-accent" onclick="showModal('auth-modal')">List Your Space</button>`;
+  }
+  setTimeout(() => lucide.createIcons(), 50);
+}
+
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
+window.handleSignUp = async function() {
+  const email = document.getElementById('auth-email').value;
+  const pass = document.getElementById('auth-pass').value;
+  const name = document.getElementById('auth-name').value;
+  clearAuthError();
+  if (!email || !pass || !name) return showAuthError('Please fill all fields.');
+  try {
+    showAuthLoading(true);
+    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    hideModal('auth-modal');
+    toast('Welcome to SpaceInn, ' + name + '! 🎉');
+  } catch(e) { showAuthError(e.message); }
+  finally { showAuthLoading(false); }
+};
+
+window.handleSignIn = async function() {
+  const email = document.getElementById('auth-email').value;
+  const pass = document.getElementById('auth-pass').value;
+  clearAuthError();
+  if (!email || !pass) return showAuthError('Please fill all fields.');
+  try {
+    showAuthLoading(true);
+    await signInWithEmailAndPassword(auth, email, pass);
+    hideModal('auth-modal');
+    toast('Welcome back! 👋');
+  } catch(e) { showAuthError(e.message); }
+  finally { showAuthLoading(false); }
+};
+
+window.handleGoogleSignIn = async function() {
+  try {
+    await signInWithPopup(auth, googleProvider);
+    hideModal('auth-modal');
+    toast('Signed in with Google! 🎉');
+  } catch(e) { showAuthError(e.message); }
+};
+
+window.handleSignOut = async function() {
+  await signOut(auth);
+  if (currentView === 'dashboard') navigate('home');
+  toast('Signed out. See you soon!');
+};
+
+function showAuthError(msg) {
+  const el = document.getElementById('auth-error');
+  if (el) { el.textContent = msg; el.style.display = 'block'; }
+}
+function clearAuthError() {
+  const el = document.getElementById('auth-error');
+  if (el) { el.textContent = ''; el.style.display = 'none'; }
+}
+function showAuthLoading(v) {
+  const btn = document.getElementById('auth-submit-btn');
+  if (btn) btn.disabled = v;
+}
+
+// ─── LISTINGS ─────────────────────────────────────────────────────────────────
+async function loadListings() {
+  const grid = document.getElementById('listings-grid');
+  if (!grid) return;
+  grid.innerHTML = `<div class="loading-shimmer"></div><div class="loading-shimmer"></div><div class="loading-shimmer"></div><div class="loading-shimmer"></div>`;
+  try {
+    const q = query(collection(db, 'listings'), orderBy('createdAt', 'desc'));
+    const snap = await getDocs(q);
+    allListings = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    renderListingsGrid();
+  } catch(e) {
+    grid.innerHTML = `<div class="empty-state"><i data-lucide="wifi-off"></i><p>Could not load listings. Check your connection.</p></div>`;
+    setTimeout(() => lucide.createIcons(), 50);
+  }
+}
+
+function renderListingsGrid() {
+  const grid = document.getElementById('listings-grid');
+  if (!grid) return;
+  let filtered = allListings.filter(l => {
+    const matchType = filterType === 'all' || l.type === filterType;
+    const matchSearch = !searchQuery || l.title?.toLowerCase().includes(searchQuery.toLowerCase()) || l.description?.toLowerCase().includes(searchQuery.toLowerCase());
+    return matchType && matchSearch;
+  });
+  if (filtered.length === 0) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><i data-lucide="search-x"></i><p>No spaces found. Try a different search.</p></div>`;
+    setTimeout(() => lucide.createIcons(), 50);
+    return;
+  }
+  grid.innerHTML = filtered.map(l => listingCard(l)).join('');
+  setTimeout(() => lucide.createIcons(), 50);
+}
+
+function listingCard(l) {
+  const img = (l.images && l.images[0]) ? l.images[0] : `https://source.unsplash.com/600x400/?${l.type === 'office' ? 'office,workspace' : 'bedroom,apartment'}&sig=${l.id}`;
+  const typeLabel = l.type === 'office' ? 'Office Space' : 'BnB';
+  const typeIcon = l.type === 'office' ? 'briefcase' : 'home';
+  const priceLabel = l.type === 'office' ? '/mo' : '/night';
+  const amenities = (l.amenities || []).slice(0, 3);
+  return `
+  <div class="listing-card" onclick="openListing('${l.id}')">
+    <div class="card-img-wrap">
+      <img src="${img}" alt="${l.title}" loading="lazy" onerror="this.src='https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=600'"/>
+      <span class="type-badge"><i data-lucide="${typeIcon}" style="width:12px;height:12px"></i> ${typeLabel}</span>
+    </div>
+    <div class="card-body">
+      <h3 class="card-title">${l.title || 'Untitled Space'}</h3>
+      <p class="card-desc">${(l.description || '').substring(0, 80)}${(l.description || '').length > 80 ? '...' : ''}</p>
+      <div class="card-amenities">
+        ${amenities.map(a => `<span class="amenity-chip">${a}</span>`).join('')}
+      </div>
+      <div class="card-footer">
+        <span class="price-tag"><strong>R${Number(l.price || 0).toLocaleString()}</strong>${priceLabel}</span>
+        <button class="neo-btn-sm accent" onclick="event.stopPropagation(); openListing('${l.id}')">View</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+window.openListing = function(id) {
+  const listing = allListings.find(l => l.id === id);
+  if (listing) navigate('listing', listing);
+};
+
+function renderListingDetail() {
+  const l = selectedListing;
+  const page = document.getElementById('page-listing');
+  if (!page || !l) return;
+  const img = (l.images && l.images[0]) ? l.images[0] : `https://source.unsplash.com/900x500/?${l.type === 'office' ? 'office' : 'bedroom'}&sig=${l.id}`;
+  const priceLabel = l.type === 'office' ? 'per month' : 'per night';
+  page.innerHTML = `
+  <nav class="topnav">
+    <button class="neo-btn-sm" onclick="navigate('home')"><i data-lucide="arrow-left" style="width:16px;height:16px"></i> Back</button>
+    <div class="logo" onclick="navigate('home')" style="cursor:pointer">SpaceInn</div>
+    <div id="nav-auth-area"></div>
+  </nav>
+  <div class="listing-detail">
+    <div class="detail-gallery">
+      <img src="${img}" alt="${l.title}" class="hero-img" onerror="this.src='https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=900'"/>
+      ${l.images && l.images.length > 1 ? `<div class="thumb-row">${l.images.slice(1).map(u => `<img src="${u}" alt="photo" class="thumb-img" onerror="this.src='https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=300'" />`).join('')}</div>` : ''}
+    </div>
+    <div class="detail-body">
+      <div class="detail-left">
+        <span class="type-badge-lg">${l.type === 'office' ? '🏢 Office Space' : '🏠 BnB'}</span>
+        <h1 class="detail-title">${l.title}</h1>
+        <p class="detail-desc">${l.description || 'No description provided.'}</p>
+        ${l.amenities && l.amenities.length > 0 ? `
+        <div class="amenities-section">
+          <h3>Amenities</h3>
+          <div class="amenities-grid">
+            ${l.amenities.map(a => `<div class="amenity-item"><i data-lucide="check-circle" style="width:16px;height:16px;color:var(--accent)"></i> ${a}</div>`).join('')}
+          </div>
+        </div>` : ''}
+      </div>
+      <div class="detail-right">
+        <div class="booking-card">
+          <div class="price-display">
+            <span class="big-price">R${Number(l.price || 0).toLocaleString()}</span>
+            <span class="price-unit">${priceLabel}</span>
+          </div>
+          ${currentUser ? `
+          <div class="booking-form">
+            <label>Check-in</label>
+            <div class="neo-input-wrap"><input type="date" id="book-start" class="neo-input" /></div>
+            <label>Check-out</label>
+            <div class="neo-input-wrap"><input type="date" id="book-end" class="neo-input" /></div>
+            <button class="neo-btn-full accent" onclick="handleBooking('${l.id}')">
+              <i data-lucide="calendar-check" style="width:16px;height:16px"></i> Book Now
+            </button>
+          </div>` : `
+          <div style="text-align:center;padding:1rem 0">
+            <p style="margin-bottom:1rem;color:var(--text-muted)">Sign in to book this space</p>
+            <button class="neo-btn-full accent" onclick="showModal('auth-modal')">Sign In to Book</button>
+          </div>`}
+        </div>
+        <div class="host-card">
+          <i data-lucide="user-circle" style="width:36px;height:36px;color:var(--accent)"></i>
+          <div>
+            <p style="font-weight:600">Hosted by</p>
+            <p style="color:var(--text-muted);font-size:0.85rem">${l.hostEmail || 'SpaceInn Host'}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  updateNavAuth();
+  setTimeout(() => lucide.createIcons(), 50);
+}
+
+// ─── BOOKING ──────────────────────────────────────────────────────────────────
+window.handleBooking = async function(listingId) {
+  if (!currentUser) return showModal('auth-modal');
+  const start = document.getElementById('book-start')?.value;
+  const end = document.getElementById('book-end')?.value;
+  if (!start || !end) return toast('Please select dates.', 'warn');
+  if (new Date(start) >= new Date(end)) return toast('End date must be after start.', 'warn');
+  try {
+    await addDoc(collection(db, 'bookings'), {
+      listingId,
+      guestId: currentUser.uid,
+      guestEmail: currentUser.email,
+      status: 'pending',
+      dates: { start: Timestamp.fromDate(new Date(start)), end: Timestamp.fromDate(new Date(end)) },
+      createdAt: serverTimestamp()
+    });
+    toast('Booking request sent! 🎉');
+  } catch(e) { toast('Booking failed: ' + e.message, 'error'); }
+};
+
+// ─── DASHBOARD ────────────────────────────────────────────────────────────────
+async function renderDashboard() {
+  const page = document.getElementById('page-dashboard');
+  if (!page) return;
+  if (!currentUser) {
+    page.innerHTML = `<nav class="topnav"><div class="logo" onclick="navigate('home')" style="cursor:pointer">SpaceInn</div><div id="nav-auth-area"></div></nav><div style="display:flex;align-items:center;justify-content:center;height:80vh"><div class="neo-card" style="text-align:center;padding:3rem"><i data-lucide="lock" style="width:48px;height:48px;color:var(--accent);margin-bottom:1rem"></i><h2>Sign In Required</h2><p style="margin:1rem 0;color:var(--text-muted)">You must be signed in to view your dashboard.</p><button class="neo-btn-accent" onclick="showModal('auth-modal')">Sign In</button></div></div>`;
+    updateNavAuth();
+    setTimeout(() => lucide.createIcons(), 50);
+    return;
+  }
+  page.innerHTML = `
+  <nav class="topnav">
+    <div class="logo" onclick="navigate('home')" style="cursor:pointer">SpaceInn</div>
+    <div id="nav-auth-area"></div>
+  </nav>
+  <div class="dashboard-wrap">
+    <div class="dash-sidebar">
+      <div class="dash-profile">
+        <div class="avatar-lg">${(currentUser.displayName || currentUser.email)[0].toUpperCase()}</div>
+        <h3>${currentUser.displayName || currentUser.email.split('@')[0]}</h3>
+        <p class="text-muted">${currentUser.email}</p>
+      </div>
+      <nav class="dash-nav">
+        <button class="dash-nav-item active" onclick="showDashTab('my-listings',this)"><i data-lucide="list" style="width:18px;height:18px"></i> My Listings</button>
+        <button class="dash-nav-item" onclick="showDashTab('my-bookings',this)"><i data-lucide="calendar" style="width:18px;height:18px"></i> My Bookings</button>
+        <button class="dash-nav-item" onclick="showDashTab('add-listing',this)"><i data-lucide="plus-circle" style="width:18px;height:18px"></i> Add Listing</button>
+      </nav>
+    </div>
+    <div class="dash-content">
+      <div id="tab-my-listings" class="dash-tab active"></div>
+      <div id="tab-my-bookings" class="dash-tab"></div>
+      <div id="tab-add-listing" class="dash-tab"></div>
+    </div>
+  </div>`;
+  updateNavAuth();
+  setTimeout(() => { lucide.createIcons(); loadMyListings(); }, 50);
+}
+
+window.showDashTab = function(tabId, btn) {
+  document.querySelectorAll('.dash-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.dash-nav-item').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + tabId)?.classList.add('active');
+  btn.classList.add('active');
+  if (tabId === 'my-listings') loadMyListings();
+  if (tabId === 'my-bookings') loadMyBookings();
+  if (tabId === 'add-listing') renderAddListingForm();
+};
+
+async function loadMyListings() {
+  const tab = document.getElementById('tab-my-listings');
+  if (!tab) return;
+  tab.innerHTML = `<h2 class="dash-section-title">My Listings</h2><div class="loading-text">Loading...</div>`;
+  try {
+    const q = query(collection(db, 'listings'), where('hostId', '==', currentUser.uid));
+    const snap = await getDocs(q);
+    const listings = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (listings.length === 0) {
+      tab.innerHTML = `<h2 class="dash-section-title">My Listings</h2><div class="empty-state"><i data-lucide="home-off"></i><p>No listings yet. Add your first space!</p><button class="neo-btn-accent" onclick="showDashTab('add-listing',document.querySelector('[onclick*=add-listing]'))">Add Listing</button></div>`;
+    } else {
+      tab.innerHTML = `<h2 class="dash-section-title">My Listings <span class="badge">${listings.length}</span></h2><div class="dash-listing-list">${listings.map(l => dashListingRow(l)).join('')}</div>`;
+    }
+    setTimeout(() => lucide.createIcons(), 50);
+  } catch(e) { tab.innerHTML = `<div class="error-msg">${e.message}</div>`; }
+}
+
+function dashListingRow(l) {
+  const img = (l.images && l.images[0]) ? l.images[0] : `https://source.unsplash.com/200x150/?${l.type === 'office' ? 'office' : 'bedroom'}&sig=${l.id}`;
+  return `
+  <div class="dash-listing-row">
+    <img src="${img}" alt="${l.title}" class="dash-listing-img" onerror="this.src='https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=200'"/>
+    <div class="dash-listing-info">
+      <h4>${l.title}</h4>
+      <p class="text-muted">${l.type === 'office' ? 'Office Space' : 'BnB'} • R${Number(l.price||0).toLocaleString()}${l.type === 'office' ? '/mo' : '/night'}</p>
+    </div>
+    <div class="dash-listing-actions">
+      <button class="neo-btn-sm" onclick="openListing('${l.id}');navigate('listing')"><i data-lucide="eye" style="width:14px;height:14px"></i></button>
+      <button class="neo-btn-sm danger" onclick="deleteListing('${l.id}')"><i data-lucide="trash-2" style="width:14px;height:14px"></i></button>
+    </div>
+  </div>`;
+}
+
+window.deleteListing = async function(id) {
+  if (!confirm('Delete this listing? This cannot be undone.')) return;
+  try {
+    await deleteDoc(doc(db, 'listings', id));
+    toast('Listing deleted.');
+    loadMyListings();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+};
+
+async function loadMyBookings() {
+  const tab = document.getElementById('tab-my-bookings');
+  if (!tab) return;
+  tab.innerHTML = `<h2 class="dash-section-title">My Bookings</h2><div class="loading-text">Loading...</div>`;
+  try {
+    const q = query(collection(db, 'bookings'), where('guestId', '==', currentUser.uid));
+    const snap = await getDocs(q);
+    const bookings = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (bookings.length === 0) {
+      tab.innerHTML = `<h2 class="dash-section-title">My Bookings</h2><div class="empty-state"><i data-lucide="calendar-x"></i><p>No bookings yet. Find a space to stay!</p><button class="neo-btn-accent" onclick="navigate('home')">Explore Spaces</button></div>`;
+    } else {
+      tab.innerHTML = `<h2 class="dash-section-title">My Bookings <span class="badge">${bookings.length}</span></h2><div class="dash-listing-list">${bookings.map(b => bookingRow(b)).join('')}</div>`;
+    }
+    setTimeout(() => lucide.createIcons(), 50);
+  } catch(e) { tab.innerHTML = `<div class="error-msg">${e.message}</div>`; }
+}
+
+function bookingRow(b) {
+  const start = b.dates?.start?.toDate ? b.dates.start.toDate().toLocaleDateString() : 'N/A';
+  const end = b.dates?.end?.toDate ? b.dates.end.toDate().toLocaleDateString() : 'N/A';
+  const statusClass = b.status === 'confirmed' ? 'confirmed' : 'pending';
+  return `
+  <div class="dash-listing-row">
+    <div class="booking-icon"><i data-lucide="calendar-days" style="width:32px;height:32px;color:var(--accent)"></i></div>
+    <div class="dash-listing-info">
+      <h4>Listing #${b.listingId?.substring(0,8) || 'Unknown'}</h4>
+      <p class="text-muted">${start} → ${end}</p>
+    </div>
+    <span class="status-badge ${statusClass}">${b.status}</span>
+  </div>`;
+}
+
+function renderAddListingForm() {
+  const tab = document.getElementById('tab-add-listing');
+  if (!tab) return;
+  uploadedImageURLs = [];
+  tab.innerHTML = `
+  <h2 class="dash-section-title">Add New Listing</h2>
+  <div class="add-listing-form">
+    <div class="form-group">
+      <label>Space Title</label>
+      <div class="neo-input-wrap"><input type="text" id="lst-title" class="neo-input" placeholder="e.g. Cozy Studio in Sandton" /></div>
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <div class="neo-input-wrap"><textarea id="lst-desc" class="neo-input neo-textarea" placeholder="Describe your space..."></textarea></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Type</label>
+        <div class="neo-input-wrap">
+          <select id="lst-type" class="neo-input">
+            <option value="bnb">BnB / Accommodation</option>
+            <option value="office">Office Space</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Price (ZAR)</label>
+        <div class="neo-input-wrap"><input type="number" id="lst-price" class="neo-input" placeholder="e.g. 1500" /></div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Amenities (comma separated)</label>
+      <div class="neo-input-wrap"><input type="text" id="lst-amenities" class="neo-input" placeholder="e.g. WiFi, Parking, Pool" /></div>
+    </div>
+    <div class="form-group">
+      <label>Images</label>
+      <div class="upload-zone" id="upload-zone" onclick="document.getElementById('img-input').click()">
+        <i data-lucide="image-plus" style="width:40px;height:40px;color:var(--accent)"></i>
+        <p>Click to upload images</p>
+        <input type="file" id="img-input" accept="image/*" multiple style="display:none" onchange="handleImageUpload(event)" />
+      </div>
+      <div id="upload-progress" style="display:none">
+        <div class="progress-bar-wrap"><div class="progress-bar-fill" id="prog-bar"></div></div>
+        <p id="prog-text" style="font-size:0.85rem;color:var(--text-muted);text-align:center">Uploading...</p>
+      </div>
+      <div id="uploaded-preview" class="uploaded-preview"></div>
+    </div>
+    <div id="listing-error" class="auth-error" style="display:none"></div>
+    <button class="neo-btn-full accent" onclick="submitListing()" id="lst-submit-btn">
+      <i data-lucide="send" style="width:16px;height:16px"></i> Publish Listing
+    </button>
+  </div>`;
+  setTimeout(() => lucide.createIcons(), 50);
+}
+
+window.handleImageUpload = async function(event) {
+  const files = Array.from(event.target.files);
+  if (!files.length) return;
+  const prog = document.getElementById('upload-progress');
+  const progBar = document.getElementById('prog-bar');
+  const progText = document.getElementById('prog-text');
+  if (prog) prog.style.display = 'block';
+  let done = 0;
+  for (const file of files) {
+    try {
+      const compressed = await compressImage(file, 1200, 0.8);
+      const storageRef = ref(storage, `listings/${currentUser.uid}/${Date.now()}_${file.name}`);
+      await uploadBytes(storageRef, compressed);
+      const url = await getDownloadURL(storageRef);
+      uploadedImageURLs.push(url);
+      done++;
+      if (progBar) progBar.style.width = `${(done / files.length) * 100}%`;
+      if (progText) progText.textContent = `Uploaded ${done}/${files.length} images`;
+    } catch(e) {
+      console.error('Upload error:', e);
+    }
+  }
+  if (prog) prog.style.display = 'none';
+  const preview = document.getElementById('uploaded-preview');
+  if (preview) {
+    preview.innerHTML = uploadedImageURLs.map(u => `<img src="${u}" alt="preview" class="preview-thumb" />`).join('');
+    toast(`${uploadedImageURLs.length} image(s) uploaded! ✅`);
+  }
+};
+
+async function compressImage(file, maxWidth, quality) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let w = img.width, h = img.height;
+        if (w > maxWidth) { h = (h * maxWidth) / w; w = maxWidth; }
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        canvas.toBlob(blob => resolve(blob), 'image/jpeg', quality);
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+window.submitListing = async function() {
+  const title = document.getElementById('lst-title')?.value?.trim();
+  const desc = document.getElementById('lst-desc')?.value?.trim();
+  const type = document.getElementById('lst-type')?.value;
+  const price = parseFloat(document.getElementById('lst-price')?.value);
+  const amenitiesRaw = document.getElementById('lst-amenities')?.value;
+  const amenities = amenitiesRaw ? amenitiesRaw.split(',').map(a => a.trim()).filter(Boolean) : [];
+  const errEl = document.getElementById('listing-error');
+  if (errEl) { errEl.style.display = 'none'; }
+  if (!title || !desc || !price) {
+    if (errEl) { errEl.textContent = 'Please fill in title, description and price.'; errEl.style.display = 'block'; }
+    return;
+  }
+  const btn = document.getElementById('lst-submit-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Publishing...'; }
+  try {
+    await addDoc(collection(db, 'listings'), {
+      hostId: currentUser.uid,
+      hostEmail: currentUser.email,
+      title, description: desc, type, price, amenities,
+      images: uploadedImageURLs,
+      createdAt: serverTimestamp()
+    });
+    toast('Listing published! 🏠');
+    uploadedImageURLs = [];
+    showDashTab('my-listings', document.querySelector('[onclick*="my-listings"]'));
+  } catch(e) {
+    if (errEl) { errEl.textContent = e.message; errEl.style.display = 'block'; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="send" style="width:16px;height:16px"></i> Publish Listing'; setTimeout(() => lucide.createIcons(), 50); }
+  }
+};
+
+// ─── SEARCH / FILTER ─────────────────────────────────────────────────────────
+window.handleSearch = function(q) { searchQuery = q; renderListingsGrid(); };
+window.setFilter = function(type, btn) {
+  filterType = type;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderListingsGrid();
+};
+
+// ─── MODAL ───────────────────────────────────────────────────────────────────
+window.showModal = function(id) {
+  const m = document.getElementById(id);
+  if (m) { m.classList.add('open'); setTimeout(() => lucide.createIcons(), 50); }
+};
+window.hideModal = function(id) {
+  const m = document.getElementById(id);
+  if (m) m.classList.remove('open');
+};
+window.toggleAuthTab = function(tab) {
+  document.getElementById('auth-signup-fields').style.display = tab === 'signup' ? 'block' : 'none';
+  document.getElementById('auth-tab-in').classList.toggle('active', tab === 'signin');
+  document.getElementById('auth-tab-up').classList.toggle('active', tab === 'signup');
+  document.getElementById('auth-submit-btn').textContent = tab === 'signup' ? 'Create Account' : 'Sign In';
+  document.getElementById('auth-submit-btn').onclick = tab === 'signup' ? handleSignUp : handleSignIn;
+};
+
+// ─── TOAST ───────────────────────────────────────────────────────────────────
+function toast(msg, type = 'success') {
+  const t = document.createElement('div');
+  t.className = `toast toast-${type}`;
+  t.textContent = msg;
+  document.getElementById('toast-container').appendChild(t);
+  setTimeout(() => t.classList.add('show'), 10);
+  setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 3500);
+}
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  navigate('home');
+  setTimeout(() => lucide.createIcons(), 100);
+});
+</script>
+
+<style>
+/* ── VARIABLES ─────────────────────────────────────────── */
+:root {
+  --bg: #e0e5ec;
+  --surface: #e8edf4;
+  --text: #3a3d42;
+  --text-muted: #7a8090;
+  --accent: #6d5dfc;
+  --accent-dark: #5848e4;
+  --accent-light: #8b7dff;
+  --danger: #fc5d5d;
+  --success: #4dc98c;
+  --warn: #f5a623;
+  --shadow-out: 9px 9px 18px #b8bec7, -9px -9px 18px #ffffff;
+  --shadow-in: inset 6px 6px 14px #b8bec7, inset -6px -6px 14px #ffffff;
+  --shadow-sm: 5px 5px 10px #c8cdd6, -5px -5px 10px #f8fdff;
+  --radius-card: 24px;
+  --radius-btn: 14px;
+  --radius-input: 12px;
+  --font-display: 'Playfair Display', Georgia, serif;
+  --font-body: 'DM Sans', sans-serif;
+  --transition: 0.2s ease;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ── PAGES ─────────────────────────────────────────────── */
+.page { display: none; min-height: 100vh; }
+.page.active { display: block; }
+
+/* ── TOPNAV ────────────────────────────────────────────── */
+.topnav {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 1rem 2rem; position: sticky; top: 0; z-index: 100;
+  background: var(--bg); box-shadow: 0 4px 20px rgba(0,0,0,0.06);
+}
+.logo {
+  font-family: var(--font-display); font-size: 1.6rem; font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text; letter-spacing: -0.5px;
+}
+.nav-user { display: flex; align-items: center; gap: 0.75rem; }
+.avatar-bubble {
+  width: 36px; height: 36px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  color: white; display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 0.9rem;
+  box-shadow: var(--shadow-sm);
+}
+.user-name { font-weight: 500; font-size: 0.9rem; color: var(--text-muted); }
+
+/* ── BUTTONS ───────────────────────────────────────────── */
+.neo-btn-sm {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  padding: 0.45rem 0.85rem; border-radius: var(--radius-btn);
+  border: none; cursor: pointer; font-family: var(--font-body);
+  font-size: 0.82rem; font-weight: 500; color: var(--text);
+  background: var(--bg); box-shadow: var(--shadow-sm);
+  transition: all var(--transition);
+}
+.neo-btn-sm:hover { box-shadow: var(--shadow-out); }
+.neo-btn-sm:active { box-shadow: var(--shadow-in); }
+.neo-btn-sm.accent, .neo-btn-sm.accent { color: var(--accent); }
+.neo-btn-sm.danger { color: var(--danger); }
+.neo-btn-accent {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.55rem 1.2rem; border-radius: var(--radius-btn);
+  border: none; cursor: pointer; font-family: var(--font-body);
+  font-size: 0.9rem; font-weight: 600; color: white;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  box-shadow: 0 4px 15px rgba(109,93,252,0.35);
+  transition: all var(--transition);
+}
+.neo-btn-accent:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(109,93,252,0.45); }
+.neo-btn-accent:active { transform: translateY(0); }
+.neo-btn-full {
+  width: 100%; display: flex; align-items: center; justify-content: center;
+  gap: 0.5rem; padding: 0.85rem 1.5rem; border-radius: var(--radius-btn);
+  border: none; cursor: pointer; font-family: var(--font-body);
+  font-size: 0.95rem; font-weight: 600; color: var(--text);
+  background: var(--bg); box-shadow: var(--shadow-sm);
+  transition: all var(--transition);
+}
+.neo-btn-full.accent {
+  color: white;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  box-shadow: 0 4px 15px rgba(109,93,252,0.35);
+}
+.neo-btn-full.accent:hover { box-shadow: 0 6px 22px rgba(109,93,252,0.5); transform: translateY(-1px); }
+.neo-btn-full:active { box-shadow: var(--shadow-in); transform: translateY(0); }
+
+/* ── INPUTS ─────────────────────────────────────────────── */
+.neo-input-wrap {
+  border-radius: var(--radius-input);
+  box-shadow: var(--shadow-in);
+  background: var(--bg);
+  padding: 0.1rem;
+}
+.neo-input {
+  width: 100%; padding: 0.7rem 1rem; border: none; outline: none;
+  background: transparent; font-family: var(--font-body); font-size: 0.9rem;
+  color: var(--text); border-radius: var(--radius-input);
+}
+.neo-input::placeholder { color: var(--text-muted); }
+.neo-textarea { resize: vertical; min-height: 100px; }
+select.neo-input { cursor: pointer; }
+
+/* ── HERO ───────────────────────────────────────────────── */
+.hero {
+  padding: 4rem 2rem 3rem;
+  text-align: center;
+  max-width: 700px; margin: 0 auto;
+}
+.hero-eyebrow {
+  display: inline-block;
+  background: var(--bg); box-shadow: var(--shadow-sm);
+  border-radius: 50px; padding: 0.3rem 1rem;
+  font-size: 0.8rem; font-weight: 500; color: var(--accent);
+  margin-bottom: 1.25rem; letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.hero h1 {
+  font-family: var(--font-display); font-size: clamp(2rem, 5vw, 3.5rem);
+  font-weight: 700; line-height: 1.15; color: var(--text);
+  margin-bottom: 1rem;
+}
+.hero h1 span {
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+.hero p { color: var(--text-muted); font-size: 1.05rem; margin-bottom: 2rem; }
+
+/* ── SEARCH BAR ─────────────────────────────────────────── */
+.search-bar-wrap {
+  max-width: 600px; margin: 0 auto 2rem;
+  background: var(--bg); border-radius: 20px;
+  box-shadow: var(--shadow-in); padding: 0.6rem 1rem;
+  display: flex; align-items: center; gap: 0.75rem;
+}
+.search-bar-wrap i { color: var(--text-muted); flex-shrink: 0; }
+.search-bar-wrap input {
+  flex: 1; border: none; outline: none; background: transparent;
+  font-family: var(--font-body); font-size: 0.95rem; color: var(--text);
+}
+.search-bar-wrap input::placeholder { color: var(--text-muted); }
+
+/* ── FILTER BUTTONS ─────────────────────────────────────── */
+.filter-row {
+  display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap;
+  margin-bottom: 2rem; padding: 0 2rem;
+}
+.filter-btn {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.5rem 1.2rem; border-radius: 50px;
+  border: none; cursor: pointer; font-family: var(--font-body);
+  font-size: 0.85rem; font-weight: 500; color: var(--text-muted);
+  background: var(--bg); box-shadow: var(--shadow-sm);
+  transition: all var(--transition);
+}
+.filter-btn:hover { color: var(--accent); }
+.filter-btn.active {
+  color: white;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  box-shadow: 0 4px 14px rgba(109,93,252,0.35);
+}
+
+/* ── LISTINGS GRID ──────────────────────────────────────── */
+.section-title {
+  font-family: var(--font-display); font-size: 1.5rem; font-weight: 600;
+  padding: 0 2rem; margin-bottom: 1.5rem; color: var(--text);
+}
+.listings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1.75rem; padding: 0 2rem 3rem;
+}
+
+/* ── CARDS ──────────────────────────────────────────────── */
+.listing-card {
+  background: var(--bg); border-radius: var(--radius-card);
+  box-shadow: var(--shadow-out); overflow: hidden; cursor: pointer;
+  transition: all var(--transition);
+}
+.listing-card:hover { transform: translateY(-4px); box-shadow: 12px 12px 24px #b0b6bf, -12px -12px 24px #ffffff; }
+.listing-card:active { box-shadow: var(--shadow-in); transform: translateY(0); }
+.card-img-wrap { position: relative; overflow: hidden; height: 200px; }
+.card-img-wrap img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.4s ease; }
+.listing-card:hover .card-img-wrap img { transform: scale(1.04); }
+.type-badge {
+  position: absolute; top: 12px; left: 12px;
+  background: rgba(255,255,255,0.92); backdrop-filter: blur(8px);
+  border-radius: 50px; padding: 0.25rem 0.75rem;
+  font-size: 0.75rem; font-weight: 600; color: var(--accent);
+  display: inline-flex; align-items: center; gap: 0.3rem;
+}
+.card-body { padding: 1.25rem; }
+.card-title { font-family: var(--font-display); font-size: 1.15rem; font-weight: 600; margin-bottom: 0.4rem; }
+.card-desc { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.75rem; line-height: 1.5; }
+.card-amenities { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.amenity-chip {
+  background: var(--bg); box-shadow: var(--shadow-sm);
+  border-radius: 50px; padding: 0.2rem 0.65rem;
+  font-size: 0.72rem; color: var(--text-muted); font-weight: 500;
+}
+.card-footer { display: flex; justify-content: space-between; align-items: center; }
+.price-tag { font-size: 0.9rem; color: var(--text-muted); }
+.price-tag strong { color: var(--accent); font-size: 1.1rem; }
+
+/* ── LOADING ─────────────────────────────────────────────── */
+.loading-shimmer {
+  height: 360px; border-radius: var(--radius-card);
+  background: linear-gradient(90deg, #d4d8e0 25%, #e0e5ec 50%, #d4d8e0 75%);
+  background-size: 200% 100%; animation: shimmer 1.5s infinite;
+}
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.loading-text { color: var(--text-muted); text-align: center; padding: 2rem; }
+.empty-state {
+  text-align: center; padding: 4rem 2rem; color: var(--text-muted);
+}
+.empty-state i { width: 56px; height: 56px; margin-bottom: 1rem; }
+.empty-state p { margin-bottom: 1.5rem; }
+
+/* ── LISTING DETAIL ──────────────────────────────────────── */
+.listing-detail { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+.detail-gallery { margin-bottom: 2rem; border-radius: var(--radius-card); overflow: hidden; box-shadow: var(--shadow-out); }
+.hero-img { width: 100%; height: 420px; object-fit: cover; display: block; }
+.thumb-row { display: flex; gap: 0.5rem; padding: 0.5rem; background: var(--bg); }
+.thumb-img { width: 120px; height: 80px; object-fit: cover; border-radius: 12px; cursor: pointer; box-shadow: var(--shadow-sm); }
+.detail-body { display: grid; grid-template-columns: 1fr 380px; gap: 2rem; }
+.type-badge-lg { font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+.detail-title { font-family: var(--font-display); font-size: 2rem; font-weight: 700; margin: 0.5rem 0 1rem; line-height: 1.2; }
+.detail-desc { color: var(--text-muted); line-height: 1.7; margin-bottom: 1.5rem; }
+.amenities-section h3 { font-family: var(--font-display); font-size: 1.1rem; margin-bottom: 1rem; }
+.amenities-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+.amenity-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; color: var(--text-muted); }
+.booking-card {
+  background: var(--bg); border-radius: var(--radius-card);
+  box-shadow: var(--shadow-out); padding: 1.75rem; margin-bottom: 1rem;
+  position: sticky; top: 90px;
+}
+.price-display { text-align: center; margin-bottom: 1.5rem; }
+.big-price { font-family: var(--font-display); font-size: 2.2rem; font-weight: 700; color: var(--accent); }
+.price-unit { display: block; font-size: 0.85rem; color: var(--text-muted); }
+.booking-form label { display: block; font-size: 0.82rem; font-weight: 600; margin: 0.85rem 0 0.35rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.host-card {
+  background: var(--bg); border-radius: var(--radius-card);
+  box-shadow: var(--shadow-out); padding: 1.25rem;
+  display: flex; align-items: center; gap: 1rem;
+}
+.error-msg { color: var(--danger); padding: 1rem; text-align: center; }
+
+/* ── DASHBOARD ───────────────────────────────────────────── */
+.dashboard-wrap { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 72px); }
+.dash-sidebar {
+  background: var(--bg); padding: 2rem 1.5rem;
+  box-shadow: 4px 0 20px rgba(0,0,0,0.04);
+}
+.dash-profile { text-align: center; margin-bottom: 2rem; padding-bottom: 2rem; border-bottom: 1px solid rgba(0,0,0,0.06); }
+.avatar-lg {
+  width: 64px; height: 64px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  color: white; display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 1.4rem; margin: 0 auto 0.75rem;
+  box-shadow: var(--shadow-out);
+}
+.dash-profile h3 { font-family: var(--font-display); font-size: 1.1rem; }
+.text-muted { color: var(--text-muted); font-size: 0.85rem; }
+.dash-nav { display: flex; flex-direction: column; gap: 0.5rem; }
+.dash-nav-item {
+  display: flex; align-items: center; gap: 0.75rem;
+  padding: 0.75rem 1rem; border-radius: var(--radius-btn);
+  border: none; cursor: pointer; font-family: var(--font-body);
+  font-size: 0.9rem; font-weight: 500; color: var(--text-muted);
+  background: transparent; transition: all var(--transition); text-align: left;
+}
+.dash-nav-item:hover { background: var(--bg); box-shadow: var(--shadow-sm); color: var(--text); }
+.dash-nav-item.active { background: var(--bg); box-shadow: var(--shadow-out); color: var(--accent); font-weight: 600; }
+.dash-content { padding: 2rem; overflow-y: auto; }
+.dash-tab { display: none; }
+.dash-tab.active { display: block; }
+.dash-section-title {
+  font-family: var(--font-display); font-size: 1.5rem; font-weight: 600;
+  margin-bottom: 1.5rem; color: var(--text);
+  display: flex; align-items: center; gap: 0.75rem;
+}
+.badge {
+  background: var(--accent); color: white; border-radius: 50px;
+  padding: 0.1rem 0.6rem; font-size: 0.75rem; font-family: var(--font-body);
+}
+.dash-listing-list { display: flex; flex-direction: column; gap: 1rem; }
+.dash-listing-row {
+  display: flex; align-items: center; gap: 1rem;
+  background: var(--bg); border-radius: 16px; box-shadow: var(--shadow-out); padding: 1rem;
+  transition: all var(--transition);
+}
+.dash-listing-row:hover { box-shadow: var(--shadow-sm); }
+.dash-listing-img { width: 80px; height: 60px; object-fit: cover; border-radius: 10px; flex-shrink: 0; }
+.dash-listing-info { flex: 1; }
+.dash-listing-info h4 { font-weight: 600; margin-bottom: 0.2rem; }
+.dash-listing-actions { display: flex; gap: 0.5rem; }
+.booking-icon { flex-shrink: 0; }
+.status-badge {
+  padding: 0.25rem 0.8rem; border-radius: 50px;
+  font-size: 0.75rem; font-weight: 600; text-transform: capitalize;
+}
+.status-badge.confirmed { background: #d4f5e6; color: #2ecc71; }
+.status-badge.pending { background: #fff3d4; color: #f5a623; }
+
+/* ── ADD LISTING FORM ────────────────────────────────────── */
+.add-listing-form { max-width: 680px; }
+.form-group { margin-bottom: 1.25rem; }
+.form-group label { display: block; font-size: 0.82rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.upload-zone {
+  border-radius: 16px; box-shadow: var(--shadow-in);
+  background: var(--bg); padding: 2.5rem; text-align: center;
+  cursor: pointer; transition: all var(--transition); color: var(--text-muted);
+}
+.upload-zone:hover { box-shadow: var(--shadow-out); }
+.upload-zone p { margin-top: 0.75rem; font-size: 0.9rem; }
+.progress-bar-wrap {
+  margin-top: 1rem; height: 6px; border-radius: 50px;
+  background: var(--bg); box-shadow: var(--shadow-in); overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%; width: 0; border-radius: 50px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  transition: width 0.3s ease;
+}
+.uploaded-preview { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1rem; }
+.preview-thumb { width: 90px; height: 70px; object-fit: cover; border-radius: 10px; box-shadow: var(--shadow-sm); }
+.neo-card { background: var(--bg); border-radius: var(--radius-card); box-shadow: var(--shadow-out); padding: 2rem; }
+
+/* ── MODAL ───────────────────────────────────────────────── */
+.modal-overlay {
+  display: none; position: fixed; inset: 0;
+  background: rgba(0,0,0,0.2); backdrop-filter: blur(6px);
+  z-index: 1000; align-items: center; justify-content: center;
+}
+.modal-overlay.open { display: flex; }
+.modal-box {
+  background: var(--bg); border-radius: var(--radius-card);
+  box-shadow: 20px 20px 40px #b0b6bf, -20px -20px 40px #ffffff;
+  padding: 2.5rem; width: 100%; max-width: 420px; position: relative;
+  animation: modalIn 0.25s ease;
+}
+@keyframes modalIn { from { opacity:0; transform: scale(0.95) translateY(10px); } to { opacity:1; transform: scale(1) translateY(0); } }
+.modal-close {
+  position: absolute; top: 1.25rem; right: 1.25rem;
+  background: var(--bg); border: none; cursor: pointer;
+  border-radius: 50%; width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: var(--shadow-sm); color: var(--text-muted);
+  font-size: 1.1rem; transition: all var(--transition);
+}
+.modal-close:hover { box-shadow: var(--shadow-out); }
+.modal-title { font-family: var(--font-display); font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; }
+.modal-sub { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.75rem; }
+.auth-tabs { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+.auth-tab {
+  flex: 1; padding: 0.5rem; border-radius: 10px; border: none;
+  cursor: pointer; font-family: var(--font-body); font-size: 0.85rem;
+  font-weight: 500; color: var(--text-muted); background: var(--bg);
+  box-shadow: var(--shadow-sm); transition: all var(--transition);
+}
+.auth-tab.active { color: white; background: linear-gradient(135deg, var(--accent), var(--accent-light)); box-shadow: 0 4px 14px rgba(109,93,252,0.35); }
+.auth-field-group { margin-bottom: 1rem; }
+.auth-field-group label { display: block; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.35rem; color: var(--text-muted); }
+.auth-error {
+  background: #ffe0e0; color: var(--danger); border-radius: 10px;
+  padding: 0.6rem 1rem; font-size: 0.85rem; margin-bottom: 1rem; display: none;
+}
+.divider { text-align: center; color: var(--text-muted); font-size: 0.85rem; margin: 1rem 0; position: relative; }
+.divider::before, .divider::after { content: ''; position: absolute; top: 50%; width: calc(50% - 20px); height: 1px; background: rgba(0,0,0,0.08); }
+.divider::before { left: 0; } .divider::after { right: 0; }
+.google-btn {
+  width: 100%; display: flex; align-items: center; justify-content: center; gap: 0.75rem;
+  padding: 0.75rem; border-radius: var(--radius-btn); border: none;
+  cursor: pointer; font-family: var(--font-body); font-size: 0.9rem; font-weight: 500;
+  background: var(--bg); box-shadow: var(--shadow-sm); color: var(--text);
+  transition: all var(--transition); margin-top: 0.5rem;
+}
+.google-btn:hover { box-shadow: var(--shadow-out); }
+.g-logo { width: 20px; height: 20px; }
+
+/* ── TOAST ───────────────────────────────────────────────── */
+#toast-container { position: fixed; bottom: 2rem; right: 2rem; z-index: 9999; display: flex; flex-direction: column; gap: 0.5rem; }
+.toast {
+  background: var(--bg); border-radius: 14px;
+  box-shadow: var(--shadow-out); padding: 0.85rem 1.25rem;
+  font-size: 0.9rem; font-weight: 500;
+  transform: translateX(120%); transition: transform 0.3s ease;
+  border-left: 4px solid var(--success); min-width: 220px;
+}
+.toast.show { transform: translateX(0); }
+.toast.toast-warn { border-color: var(--warn); }
+.toast.toast-error { border-color: var(--danger); }
+
+/* ── FOOTER ──────────────────────────────────────────────── */
+.site-footer {
+  background: var(--bg); box-shadow: 0 -4px 20px rgba(0,0,0,0.04);
+  padding: 3rem 2rem; margin-top: 2rem;
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 2rem;
+}
+.footer-brand .logo { font-size: 1.4rem; margin-bottom: 0.5rem; display: inline-block; }
+.footer-brand p { color: var(--text-muted); font-size: 0.85rem; max-width: 240px; }
+.footer-col h4 { font-weight: 600; margin-bottom: 0.75rem; font-size: 0.9rem; }
+.footer-col ul { list-style: none; }
+.footer-col ul li { margin-bottom: 0.4rem; }
+.footer-col ul li a { color: var(--text-muted); text-decoration: none; font-size: 0.85rem; transition: color var(--transition); }
+.footer-col ul li a:hover { color: var(--accent); }
+.footer-bottom {
+  text-align: center; padding: 1rem 2rem;
+  color: var(--text-muted); font-size: 0.8rem;
+  border-top: 1px solid rgba(0,0,0,0.06);
+}
+
+/* ── RESPONSIVE ──────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .detail-body { grid-template-columns: 1fr; }
+  .dashboard-wrap { grid-template-columns: 1fr; }
+  .dash-sidebar { padding: 1.5rem; }
+  .dash-nav { flex-direction: row; flex-wrap: wrap; }
+  .site-footer { grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  .topnav { padding: 0.75rem 1rem; }
+  .hero { padding: 2rem 1rem 1.5rem; }
+  .listings-grid { padding: 0 1rem 2rem; gap: 1.25rem; }
+  .section-title { padding: 0 1rem; }
+  .filter-row { padding: 0 1rem; }
+  .form-row { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── HOME PAGE ──────────────────────────────────────────── -->
+<div class="page" id="page-home">
+  <nav class="topnav">
+    <div class="logo">SpaceInn</div>
+    <div id="nav-auth-area">
+      <button class="neo-btn-sm" onclick="showModal('auth-modal')"><i data-lucide="user" style="width:14px;height:14px"></i> Sign In</button>
+      <button class="neo-btn-accent" onclick="showModal('auth-modal')">List Your Space</button>
+    </div>
+  </nav>
+
+  <div class="hero">
+    <span class="hero-eyebrow">✦ BnBs &amp; Office Spaces</span>
+    <h1>Find Your Perfect <span>Space</span> to Stay or Work</h1>
+    <p>Discover unique accommodations and office spaces across South Africa — curated for comfort, productivity, and experience.</p>
+  </div>
+
+  <div class="search-bar-wrap" style="max-width:600px;margin:0 auto 1.5rem">
+    <i data-lucide="search" style="width:18px;height:18px;color:var(--text-muted)"></i>
+    <input type="text" placeholder="Search spaces by name or description..." oninput="handleSearch(this.value)" />
+  </div>
+
+  <div class="filter-row">
+    <button class="filter-btn active" onclick="setFilter('all',this)"><i data-lucide="grid-3x3" style="width:14px;height:14px"></i> All Spaces</button>
+    <button class="filter-btn" onclick="setFilter('bnb',this)"><i data-lucide="home" style="width:14px;height:14px"></i> BnBs</button>
+    <button class="filter-btn" onclick="setFilter('office',this)"><i data-lucide="briefcase" style="width:14px;height:14px"></i> Offices</button>
+  </div>
+
+  <h2 class="section-title">Available Spaces</h2>
+  <div class="listings-grid" id="listings-grid">
+    <div class="loading-shimmer"></div>
+    <div class="loading-shimmer"></div>
+    <div class="loading-shimmer"></div>
+    <div class="loading-shimmer"></div>
+  </div>
+
+  <footer class="site-footer">
+    <div class="footer-brand">
+      <div class="logo">SpaceInn</div>
+      <p>South Africa's premier platform for unique BnBs and professional office spaces.</p>
+    </div>
+    <div class="footer-col">
+      <h4>Explore</h4>
+      <ul>
+        <li><a href="#" onclick="setFilter('bnb',document.querySelectorAll('.filter-btn')[1])">BnBs</a></li>
+        <li><a href="#" onclick="setFilter('office',document.querySelectorAll('.filter-btn')[2])">Office Spaces</a></li>
+        <li><a href="#" onclick="showModal('auth-modal')">Become a Host</a></li>
+      </ul>
+    </div>
+    <div class="footer-col">
+      <h4>Account</h4>
+      <ul>
+        <li><a href="#" onclick="showModal('auth-modal')">Sign In</a></li>
+        <li><a href="#" onclick="showModal('auth-modal')">Sign Up</a></li>
+        <li><a href="#" onclick="navigate('dashboard')">Dashboard</a></li>
+      </ul>
+    </div>
+  </footer>
+  <div class="footer-bottom">© 2025 SpaceInn. All rights reserved.</div>
+</div>
+
+<!-- ── LISTING DETAIL PAGE ─────────────────────────────────── -->
+<div class="page" id="page-listing"></div>
+
+<!-- ── DASHBOARD PAGE ─────────────────────────────────────── -->
+<div class="page" id="page-dashboard"></div>
+
+<!-- ── AUTH MODAL ─────────────────────────────────────────── -->
+<div class="modal-overlay" id="auth-modal" onclick="if(event.target===this)hideModal('auth-modal')">
+  <div class="modal-box">
+    <button class="modal-close" onclick="hideModal('auth-modal')">✕</button>
+    <h2 class="modal-title">Welcome to SpaceInn</h2>
+    <p class="modal-sub">Sign in or create an account to continue</p>
+
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="auth-tab-in" onclick="toggleAuthTab('signin')">Sign In</button>
+      <button class="auth-tab" id="auth-tab-up" onclick="toggleAuthTab('signup')">Sign Up</button>
+    </div>
+
+    <div id="auth-error" class="auth-error"></div>
+
+    <div id="auth-signup-fields" style="display:none">
+      <div class="auth-field-group">
+        <label>Full Name</label>
+        <div class="neo-input-wrap"><input type="text" id="auth-name" class="neo-input" placeholder="Your name" /></div>
+      </div>
+    </div>
+
+    <div class="auth-field-group">
+      <label>Email</label>
+      <div class="neo-input-wrap"><input type="email" id="auth-email" class="neo-input" placeholder="you@example.com" /></div>
+    </div>
+    <div class="auth-field-group" style="margin-bottom:1.25rem">
+      <label>Password</label>
+      <div class="neo-input-wrap"><input type="password" id="auth-pass" class="neo-input" placeholder="••••••••" /></div>
+    </div>
+
+    <button class="neo-btn-full accent" id="auth-submit-btn" onclick="handleSignIn()">Sign In</button>
+
+    <div class="divider">or</div>
+
+    <button class="google-btn" onclick="handleGoogleSignIn()">
+      <svg class="g-logo" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+      Continue with Google
+    </button>
+  </div>
+</div>
+
+<!-- ── TOAST CONTAINER ────────────────────────────────────── -->
+<div id="toast-container"></div>
+
+</body>
+</html>
