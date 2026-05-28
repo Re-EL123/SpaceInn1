@@ -12,7 +12,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import { getFirestore, collection, addDoc, getDocs, query, where, orderBy, doc, updateDoc, deleteDoc, serverTimestamp, Timestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyBLD-z9z2Le8DAqYobMkd2kwurgI9B69rY",
@@ -36,8 +36,10 @@ let currentView = 'home';
 let allListings = [];
 let selectedListing = null;
 let uploadedImageURLs = [];
+let editUploadedImageURLs = [];
 let filterType = 'all';
 let searchQuery = '';
+let hostListingsCache = [];
 
 // ─── AUTH STATE ───────────────────────────────────────────────────────────────
 onAuthStateChanged(auth, user => {
@@ -288,6 +290,185 @@ window.handleBooking = async function(listingId) {
   } catch(e) { toast('Booking failed: ' + e.message, 'error'); }
 };
 
+// ─── HOST BOOKING MANAGEMENT ──────────────────────────────────────────────────
+async function loadHostBookings() {
+  const tab = document.getElementById('tab-host-bookings');
+  if (!tab) return;
+  tab.innerHTML = `<h2 class="dash-section-title">Guest Bookings</h2><div class="loading-text">Loading bookings...</div>`;
+  try {
+    // Get host's listings first
+    const lq = query(collection(db, 'listings'), where('hostId', '==', currentUser.uid));
+    const lsnap = await getDocs(lq);
+    hostListingsCache = lsnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const listingIds = hostListingsCache.map(l => l.id);
+
+    if (listingIds.length === 0) {
+      tab.innerHTML = `<h2 class="dash-section-title">Guest Bookings</h2>
+        <div class="empty-state"><i data-lucide="calendar-x"></i><p>You have no listings yet. Add a listing first to receive bookings.</p></div>`;
+      setTimeout(() => lucide.createIcons(), 50);
+      return;
+    }
+
+    // Fetch bookings for each listing (Firestore 'in' limited to 10 items)
+    let allBookings = [];
+    const chunks = [];
+    for (let i = 0; i < listingIds.length; i += 10) chunks.push(listingIds.slice(i, i + 10));
+    for (const chunk of chunks) {
+      const bq = query(collection(db, 'bookings'), where('listingId', 'in', chunk));
+      const bsnap = await getDocs(bq);
+      allBookings.push(...bsnap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }
+
+    // Sort by createdAt descending
+    allBookings.sort((a, b) => {
+      const ta = a.createdAt?.toDate?.() || 0;
+      const tb = b.createdAt?.toDate?.() || 0;
+      return tb - ta;
+    });
+
+    if (allBookings.length === 0) {
+      tab.innerHTML = `<h2 class="dash-section-title">Guest Bookings</h2>
+        <div class="empty-state"><i data-lucide="inbox"></i><p>No bookings yet for your listings.</p></div>`;
+      setTimeout(() => lucide.createIcons(), 50);
+      return;
+    }
+
+    const pendingCount = allBookings.filter(b => b.status === 'pending').length;
+    tab.innerHTML = `
+      <div class="dash-section-header">
+        <h2 class="dash-section-title">Guest Bookings <span class="badge">${allBookings.length}</span></h2>
+        ${pendingCount > 0 ? `<span class="pending-alert"><i data-lucide="bell" style="width:14px;height:14px"></i> ${pendingCount} pending</span>` : ''}
+      </div>
+      <div class="bookings-filter-row">
+        <button class="bookings-filter-btn active" onclick="filterHostBookings('all',this)">All</button>
+        <button class="bookings-filter-btn" onclick="filterHostBookings('pending',this)">Pending</button>
+        <button class="bookings-filter-btn" onclick="filterHostBookings('confirmed',this)">Confirmed</button>
+        <button class="bookings-filter-btn" onclick="filterHostBookings('rejected',this)">Rejected</button>
+        <button class="bookings-filter-btn" onclick="filterHostBookings('cancelled',this)">Cancelled</button>
+      </div>
+      <div id="host-bookings-list" class="host-bookings-list">
+        ${allBookings.map(b => hostBookingCard(b)).join('')}
+      </div>`;
+    // Store for filtering
+    tab.dataset.bookings = JSON.stringify(allBookings);
+    setTimeout(() => lucide.createIcons(), 50);
+  } catch(e) {
+    tab.innerHTML = `<h2 class="dash-section-title">Guest Bookings</h2><div class="error-msg">Error: ${e.message}</div>`;
+  }
+}
+
+function hostBookingCard(b) {
+  const listing = hostListingsCache.find(l => l.id === b.listingId);
+  const listingTitle = listing ? listing.title : `Listing #${(b.listingId||'').substring(0,8)}`;
+  const listingImg = listing?.images?.[0] || `https://source.unsplash.com/120x90/?bedroom&sig=${b.listingId}`;
+  const start = b.dates?.start?.toDate ? b.dates.start.toDate().toLocaleDateString('en-ZA', {day:'numeric',month:'short',year:'numeric'}) : 'N/A';
+  const end   = b.dates?.end?.toDate   ? b.dates.end.toDate().toLocaleDateString('en-ZA', {day:'numeric',month:'short',year:'numeric'})   : 'N/A';
+
+  // Calculate nights/months
+  let duration = '';
+  if (b.dates?.start?.toDate && b.dates?.end?.toDate) {
+    const diff = (b.dates.end.toDate() - b.dates.start.toDate()) / (1000 * 60 * 60 * 24);
+    duration = listing?.type === 'office' ? `${Math.ceil(diff/30)} month(s)` : `${diff} night(s)`;
+  }
+
+  // Calculate total price
+  let total = '';
+  if (listing?.price && b.dates?.start?.toDate && b.dates?.end?.toDate) {
+    const diff = (b.dates.end.toDate() - b.dates.start.toDate()) / (1000 * 60 * 60 * 24);
+    if (listing.type === 'office') {
+      total = `R${(listing.price * Math.ceil(diff/30)).toLocaleString()}`;
+    } else {
+      total = `R${(listing.price * diff).toLocaleString()}`;
+    }
+  }
+
+  const statusMap = {
+    pending:   { cls: 'pending',   icon: 'clock',      label: 'Pending' },
+    confirmed: { cls: 'confirmed', icon: 'check-circle',label: 'Confirmed' },
+    rejected:  { cls: 'rejected',  icon: 'x-circle',   label: 'Rejected' },
+    cancelled: { cls: 'cancelled', icon: 'ban',         label: 'Cancelled' }
+  };
+  const st = statusMap[b.status] || statusMap.pending;
+
+  const createdAt = b.createdAt?.toDate ? b.createdAt.toDate().toLocaleDateString('en-ZA', {day:'numeric',month:'short',year:'numeric'}) : '';
+
+  return `
+  <div class="host-booking-card" data-status="${b.status}" data-id="${b.id}">
+    <div class="hbc-img-col">
+      <img src="${listingImg}" alt="${listingTitle}" class="hbc-listing-img" onerror="this.src='https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=200'"/>
+    </div>
+    <div class="hbc-body">
+      <div class="hbc-top">
+        <div>
+          <h4 class="hbc-listing-title">${listingTitle}</h4>
+          <p class="hbc-guest"><i data-lucide="user" style="width:13px;height:13px"></i> ${b.guestEmail || 'Unknown guest'}</p>
+        </div>
+        <span class="status-badge ${st.cls}">
+          <i data-lucide="${st.icon}" style="width:12px;height:12px"></i> ${st.label}
+        </span>
+      </div>
+      <div class="hbc-dates">
+        <div class="hbc-date-block">
+          <span class="hbc-date-label">Check-in</span>
+          <span class="hbc-date-val">${start}</span>
+        </div>
+        <div class="hbc-date-sep"><i data-lucide="arrow-right" style="width:16px;height:16px;color:var(--text-muted)"></i></div>
+        <div class="hbc-date-block">
+          <span class="hbc-date-label">Check-out</span>
+          <span class="hbc-date-val">${end}</span>
+        </div>
+        ${duration ? `<div class="hbc-date-block"><span class="hbc-date-label">Duration</span><span class="hbc-date-val">${duration}</span></div>` : ''}
+        ${total ? `<div class="hbc-date-block"><span class="hbc-date-label">Est. Total</span><span class="hbc-date-val hbc-total">${total}</span></div>` : ''}
+      </div>
+      ${createdAt ? `<p class="hbc-created">Booked on ${createdAt}</p>` : ''}
+    </div>
+    <div class="hbc-actions">
+      ${b.status === 'pending' ? `
+        <button class="hbc-btn confirm" onclick="updateBookingStatus('${b.id}','confirmed')">
+          <i data-lucide="check" style="width:14px;height:14px"></i> Confirm
+        </button>
+        <button class="hbc-btn reject" onclick="updateBookingStatus('${b.id}','rejected')">
+          <i data-lucide="x" style="width:14px;height:14px"></i> Reject
+        </button>` : ''}
+      ${b.status === 'confirmed' ? `
+        <button class="hbc-btn cancel" onclick="updateBookingStatus('${b.id}','cancelled')">
+          <i data-lucide="ban" style="width:14px;height:14px"></i> Cancel
+        </button>` : ''}
+      ${(b.status === 'rejected' || b.status === 'cancelled') ? `
+        <button class="hbc-btn confirm" onclick="updateBookingStatus('${b.id}','confirmed')">
+          <i data-lucide="rotate-ccw" style="width:14px;height:14px"></i> Reactivate
+        </button>` : ''}
+    </div>
+  </div>`;
+}
+
+window.updateBookingStatus = async function(bookingId, status) {
+  const labels = { confirmed: 'confirm', rejected: 'reject', cancelled: 'cancel', pending: 'reactivate' };
+  if (!confirm(`Are you sure you want to ${labels[status] || status} this booking?`)) return;
+  try {
+    await updateDoc(doc(db, 'bookings', bookingId), { status, updatedAt: serverTimestamp() });
+    const statusLabels = { confirmed: '✅ Booking confirmed!', rejected: 'Booking rejected.', cancelled: 'Booking cancelled.', pending: 'Booking reactivated.' };
+    toast(statusLabels[status] || 'Status updated.');
+    loadHostBookings();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+};
+
+window.filterHostBookings = function(status, btn) {
+  document.querySelectorAll('.bookings-filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const tab = document.getElementById('tab-host-bookings');
+  const allBookings = JSON.parse(tab.dataset.bookings || '[]');
+  const filtered = status === 'all' ? allBookings : allBookings.filter(b => b.status === status);
+  const list = document.getElementById('host-bookings-list');
+  if (!list) return;
+  if (filtered.length === 0) {
+    list.innerHTML = `<div class="empty-state" style="padding:2rem"><i data-lucide="inbox"></i><p>No ${status} bookings.</p></div>`;
+  } else {
+    list.innerHTML = filtered.map(b => hostBookingCard(b)).join('');
+  }
+  setTimeout(() => lucide.createIcons(), 50);
+};
+
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 async function renderDashboard() {
   const page = document.getElementById('page-dashboard');
@@ -312,14 +493,17 @@ async function renderDashboard() {
       </div>
       <nav class="dash-nav">
         <button class="dash-nav-item active" onclick="showDashTab('my-listings',this)"><i data-lucide="list" style="width:18px;height:18px"></i> My Listings</button>
+        <button class="dash-nav-item" onclick="showDashTab('host-bookings',this)"><i data-lucide="calendar-check" style="width:18px;height:18px"></i> Guest Bookings</button>
         <button class="dash-nav-item" onclick="showDashTab('my-bookings',this)"><i data-lucide="calendar" style="width:18px;height:18px"></i> My Bookings</button>
         <button class="dash-nav-item" onclick="showDashTab('add-listing',this)"><i data-lucide="plus-circle" style="width:18px;height:18px"></i> Add Listing</button>
       </nav>
     </div>
     <div class="dash-content">
       <div id="tab-my-listings" class="dash-tab active"></div>
+      <div id="tab-host-bookings" class="dash-tab"></div>
       <div id="tab-my-bookings" class="dash-tab"></div>
       <div id="tab-add-listing" class="dash-tab"></div>
+      <div id="tab-edit-listing" class="dash-tab"></div>
     </div>
   </div>`;
   updateNavAuth();
@@ -330,8 +514,9 @@ window.showDashTab = function(tabId, btn) {
   document.querySelectorAll('.dash-tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.dash-nav-item').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + tabId)?.classList.add('active');
-  btn.classList.add('active');
+  if (btn) btn.classList.add('active');
   if (tabId === 'my-listings') loadMyListings();
+  if (tabId === 'host-bookings') loadHostBookings();
   if (tabId === 'my-bookings') loadMyBookings();
   if (tabId === 'add-listing') renderAddListingForm();
 };
@@ -364,6 +549,7 @@ function dashListingRow(l) {
     </div>
     <div class="dash-listing-actions">
       <button class="neo-btn-sm" onclick="openListing('${l.id}');navigate('listing')"><i data-lucide="eye" style="width:14px;height:14px"></i></button>
+      <button class="neo-btn-sm accent" onclick="startEditListing('${l.id}')" title="Edit listing"><i data-lucide="pencil" style="width:14px;height:14px"></i></button>
       <button class="neo-btn-sm danger" onclick="deleteListing('${l.id}')"><i data-lucide="trash-2" style="width:14px;height:14px"></i></button>
     </div>
   </div>`;
@@ -378,6 +564,169 @@ window.deleteListing = async function(id) {
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 };
 
+// ─── EDIT LISTING ─────────────────────────────────────────────────────────────
+window.startEditListing = async function(listingId) {
+  // Fetch fresh listing data
+  const q = query(collection(db, 'listings'), where('hostId', '==', currentUser.uid));
+  const snap = await getDocs(q);
+  const listings = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const l = listings.find(x => x.id === listingId);
+  if (!l) return toast('Listing not found.', 'error');
+
+  // Switch to edit tab
+  document.querySelectorAll('.dash-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.dash-nav-item').forEach(b => b.classList.remove('active'));
+  const editTab = document.getElementById('tab-edit-listing');
+  if (editTab) editTab.classList.add('active');
+
+  editUploadedImageURLs = [...(l.images || [])];
+  renderEditListingForm(l);
+};
+
+function renderEditListingForm(l) {
+  const tab = document.getElementById('tab-edit-listing');
+  if (!tab) return;
+  const amenitiesStr = (l.amenities || []).join(', ');
+  tab.innerHTML = `
+  <div class="dash-section-header">
+    <h2 class="dash-section-title">Edit Listing</h2>
+    <button class="neo-btn-sm" onclick="showDashTab('my-listings', document.querySelector('[onclick*=my-listings]'))">
+      <i data-lucide="arrow-left" style="width:14px;height:14px"></i> Back to Listings
+    </button>
+  </div>
+  <div class="add-listing-form">
+    <div class="form-group">
+      <label>Space Title</label>
+      <div class="neo-input-wrap"><input type="text" id="edit-title" class="neo-input" value="${escapeHtml(l.title||'')}" /></div>
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <div class="neo-input-wrap"><textarea id="edit-desc" class="neo-input neo-textarea">${escapeHtml(l.description||'')}</textarea></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Type</label>
+        <div class="neo-input-wrap">
+          <select id="edit-type" class="neo-input">
+            <option value="bnb" ${l.type === 'bnb' ? 'selected' : ''}>BnB / Accommodation</option>
+            <option value="office" ${l.type === 'office' ? 'selected' : ''}>Office Space</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Price (ZAR)</label>
+        <div class="neo-input-wrap"><input type="number" id="edit-price" class="neo-input" value="${l.price||''}" /></div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Amenities (comma separated)</label>
+      <div class="neo-input-wrap"><input type="text" id="edit-amenities" class="neo-input" value="${escapeHtml(amenitiesStr)}" /></div>
+    </div>
+
+    <!-- IMAGE MANAGEMENT -->
+    <div class="form-group">
+      <label>Photos</label>
+      <div id="edit-images-grid" class="edit-images-grid">
+        ${editUploadedImageURLs.map((url, i) => editImageThumb(url, i)).join('')}
+      </div>
+      <div class="upload-zone" id="edit-upload-zone" onclick="document.getElementById('edit-img-input').click()" style="margin-top:0.75rem">
+        <i data-lucide="image-plus" style="width:36px;height:36px;color:var(--accent)"></i>
+        <p>Click to add more photos</p>
+        <input type="file" id="edit-img-input" accept="image/*" multiple style="display:none" onchange="handleEditImageUpload(event)" />
+      </div>
+      <div id="edit-upload-progress" style="display:none">
+        <div class="progress-bar-wrap"><div class="progress-bar-fill" id="edit-prog-bar"></div></div>
+        <p id="edit-prog-text" style="font-size:0.85rem;color:var(--text-muted);text-align:center">Uploading...</p>
+      </div>
+    </div>
+
+    <div id="edit-listing-error" class="auth-error" style="display:none"></div>
+    <button class="neo-btn-full accent" onclick="submitEditListing('${l.id}')" id="edit-submit-btn">
+      <i data-lucide="save" style="width:16px;height:16px"></i> Save Changes
+    </button>
+  </div>`;
+  setTimeout(() => lucide.createIcons(), 50);
+}
+
+function editImageThumb(url, index) {
+  return `
+  <div class="edit-img-thumb" id="edit-img-${index}">
+    <img src="${url}" alt="photo ${index+1}" onerror="this.src='https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=200'" />
+    <button class="edit-img-remove" onclick="removeEditImage(${index})" title="Remove photo">
+      <i data-lucide="x" style="width:14px;height:14px"></i>
+    </button>
+    ${index === 0 ? '<span class="edit-img-primary">Cover</span>' : ''}
+  </div>`;
+}
+
+window.removeEditImage = function(index) {
+  editUploadedImageURLs.splice(index, 1);
+  refreshEditImagesGrid();
+};
+
+function refreshEditImagesGrid() {
+  const grid = document.getElementById('edit-images-grid');
+  if (!grid) return;
+  grid.innerHTML = editUploadedImageURLs.map((url, i) => editImageThumb(url, i)).join('');
+  setTimeout(() => lucide.createIcons(), 50);
+}
+
+window.handleEditImageUpload = async function(event) {
+  const files = Array.from(event.target.files);
+  if (!files.length) return;
+  const prog = document.getElementById('edit-upload-progress');
+  const progBar = document.getElementById('edit-prog-bar');
+  const progText = document.getElementById('edit-prog-text');
+  if (prog) prog.style.display = 'block';
+  let done = 0;
+  for (const file of files) {
+    try {
+      const compressed = await compressImage(file, 1200, 0.8);
+      const storageRef = ref(storage, `listings/${currentUser.uid}/${Date.now()}_${file.name}`);
+      await uploadBytes(storageRef, compressed);
+      const url = await getDownloadURL(storageRef);
+      editUploadedImageURLs.push(url);
+      done++;
+      if (progBar) progBar.style.width = `${(done / files.length) * 100}%`;
+      if (progText) progText.textContent = `Uploaded ${done}/${files.length} images`;
+    } catch(e) { console.error('Upload error:', e); }
+  }
+  if (prog) prog.style.display = 'none';
+  refreshEditImagesGrid();
+  toast(`${done} image(s) added! ✅`);
+};
+
+window.submitEditListing = async function(listingId) {
+  const title = document.getElementById('edit-title')?.value?.trim();
+  const desc = document.getElementById('edit-desc')?.value?.trim();
+  const type = document.getElementById('edit-type')?.value;
+  const price = parseFloat(document.getElementById('edit-price')?.value);
+  const amenitiesRaw = document.getElementById('edit-amenities')?.value;
+  const amenities = amenitiesRaw ? amenitiesRaw.split(',').map(a => a.trim()).filter(Boolean) : [];
+  const errEl = document.getElementById('edit-listing-error');
+  if (errEl) errEl.style.display = 'none';
+  if (!title || !desc || !price) {
+    if (errEl) { errEl.textContent = 'Please fill in title, description and price.'; errEl.style.display = 'block'; }
+    return;
+  }
+  const btn = document.getElementById('edit-submit-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader" style="width:16px;height:16px"></i> Saving...'; setTimeout(() => lucide.createIcons(), 10); }
+  try {
+    await updateDoc(doc(db, 'listings', listingId), {
+      title, description: desc, type, price, amenities,
+      images: editUploadedImageURLs,
+      updatedAt: serverTimestamp()
+    });
+    toast('Listing updated! ✅');
+    showDashTab('my-listings', document.querySelector('[onclick*="my-listings"]'));
+  } catch(e) {
+    if (errEl) { errEl.textContent = e.message; errEl.style.display = 'block'; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="save" style="width:16px;height:16px"></i> Save Changes'; setTimeout(() => lucide.createIcons(), 50); }
+  }
+};
+
+// ─── MY BOOKINGS ──────────────────────────────────────────────────────────────
 async function loadMyBookings() {
   const tab = document.getElementById('tab-my-bookings');
   if (!tab) return;
@@ -398,7 +747,7 @@ async function loadMyBookings() {
 function bookingRow(b) {
   const start = b.dates?.start?.toDate ? b.dates.start.toDate().toLocaleDateString() : 'N/A';
   const end = b.dates?.end?.toDate ? b.dates.end.toDate().toLocaleDateString() : 'N/A';
-  const statusClass = b.status === 'confirmed' ? 'confirmed' : 'pending';
+  const statusClass = b.status === 'confirmed' ? 'confirmed' : b.status === 'rejected' ? 'rejected' : b.status === 'cancelled' ? 'cancelled' : 'pending';
   return `
   <div class="dash-listing-row">
     <div class="booking-icon"><i data-lucide="calendar-days" style="width:32px;height:32px;color:var(--accent)"></i></div>
@@ -410,6 +759,7 @@ function bookingRow(b) {
   </div>`;
 }
 
+// ─── ADD LISTING FORM ─────────────────────────────────────────────────────────
 function renderAddListingForm() {
   const tab = document.getElementById('tab-add-listing');
   if (!tab) return;
@@ -483,9 +833,7 @@ window.handleImageUpload = async function(event) {
       done++;
       if (progBar) progBar.style.width = `${(done / files.length) * 100}%`;
       if (progText) progText.textContent = `Uploaded ${done}/${files.length} images`;
-    } catch(e) {
-      console.error('Upload error:', e);
-    }
+    } catch(e) { console.error('Upload error:', e); }
   }
   if (prog) prog.style.display = 'none';
   const preview = document.getElementById('uploaded-preview');
@@ -583,6 +931,11 @@ function toast(msg, type = 'success') {
   setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 3500);
 }
 
+// ─── UTILS ────────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
   navigate('home');
@@ -593,25 +946,28 @@ window.addEventListener('DOMContentLoaded', () => {
 <style>
 /* ── VARIABLES ─────────────────────────────────────────── */
 :root {
-  --bg: #e0e5ec;
-  --surface: #e8edf4;
-  --text: #3a3d42;
-  --text-muted: #7a8090;
-  --accent: #6d5dfc;
-  --accent-dark: #5848e4;
-  --accent-light: #8b7dff;
-  --danger: #fc5d5d;
-  --success: #4dc98c;
-  --warn: #f5a623;
-  --shadow-out: 9px 9px 18px #b8bec7, -9px -9px 18px #ffffff;
-  --shadow-in: inset 6px 6px 14px #b8bec7, inset -6px -6px 14px #ffffff;
-  --shadow-sm: 5px 5px 10px #c8cdd6, -5px -5px 10px #f8fdff;
-  --radius-card: 24px;
-  --radius-btn: 14px;
+  --bg: #e8e8e8;
+  --surface: #f0f0f0;
+  --surface-white: #ffffff;
+  --text: #141414;
+  --text-muted: #6b6b6b;
+  --accent: #c8102e;
+  --accent-dark: #a00d24;
+  --accent-light: #e63950;
+  --danger: #c8102e;
+  --success: #2e7d32;
+  --warn: #e65100;
+  --shadow-out: 8px 8px 18px #c4c4c4, -8px -8px 18px #ffffff;
+  --shadow-in: inset 6px 6px 14px #c4c4c4, inset -6px -6px 14px #ffffff;
+  --shadow-sm: 4px 4px 10px #c8c8c8, -4px -4px 10px #ffffff;
+  --shadow-card: 10px 10px 24px #c0c0c0, -10px -10px 24px #ffffff;
+  --radius-card: 22px;
+  --radius-btn: 12px;
   --radius-input: 12px;
   --font-display: 'Playfair Display', Georgia, serif;
   --font-body: 'DM Sans', sans-serif;
   --transition: 0.2s ease;
+  --border-subtle: 1px solid rgba(0,0,0,0.07);
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -634,18 +990,21 @@ html, body {
 .topnav {
   display: flex; align-items: center; justify-content: space-between;
   padding: 1rem 2rem; position: sticky; top: 0; z-index: 100;
-  background: var(--bg); box-shadow: 0 4px 20px rgba(0,0,0,0.06);
+  background: var(--bg); box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+  border-bottom: 2px solid rgba(200,16,46,0.12);
 }
 .logo {
   font-family: var(--font-display); font-size: 1.6rem; font-weight: 700;
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  background-clip: text; letter-spacing: -0.5px;
+  color: var(--text); letter-spacing: -0.5px; position: relative;
+}
+.logo::after {
+  content: ''; position: absolute; bottom: 0; left: 0; width: 100%; height: 3px;
+  background: var(--accent); border-radius: 2px;
 }
 .nav-user { display: flex; align-items: center; gap: 0.75rem; }
 .avatar-bubble {
   width: 36px; height: 36px; border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  background: var(--accent);
   color: white; display: flex; align-items: center; justify-content: center;
   font-weight: 700; font-size: 0.9rem;
   box-shadow: var(--shadow-sm);
@@ -663,18 +1022,18 @@ html, body {
 }
 .neo-btn-sm:hover { box-shadow: var(--shadow-out); }
 .neo-btn-sm:active { box-shadow: var(--shadow-in); }
-.neo-btn-sm.accent, .neo-btn-sm.accent { color: var(--accent); }
+.neo-btn-sm.accent { color: var(--accent); font-weight: 600; }
 .neo-btn-sm.danger { color: var(--danger); }
 .neo-btn-accent {
   display: inline-flex; align-items: center; gap: 0.4rem;
   padding: 0.55rem 1.2rem; border-radius: var(--radius-btn);
   border: none; cursor: pointer; font-family: var(--font-body);
   font-size: 0.9rem; font-weight: 600; color: white;
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
-  box-shadow: 0 4px 15px rgba(109,93,252,0.35);
+  background: var(--accent);
+  box-shadow: 0 4px 15px rgba(200,16,46,0.35);
   transition: all var(--transition);
 }
-.neo-btn-accent:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(109,93,252,0.45); }
+.neo-btn-accent:hover { transform: translateY(-1px); background: var(--accent-dark); box-shadow: 0 6px 20px rgba(200,16,46,0.45); }
 .neo-btn-accent:active { transform: translateY(0); }
 .neo-btn-full {
   width: 100%; display: flex; align-items: center; justify-content: center;
@@ -686,10 +1045,10 @@ html, body {
 }
 .neo-btn-full.accent {
   color: white;
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
-  box-shadow: 0 4px 15px rgba(109,93,252,0.35);
+  background: var(--accent);
+  box-shadow: 0 4px 15px rgba(200,16,46,0.35);
 }
-.neo-btn-full.accent:hover { box-shadow: 0 6px 22px rgba(109,93,252,0.5); transform: translateY(-1px); }
+.neo-btn-full.accent:hover { box-shadow: 0 6px 22px rgba(200,16,46,0.5); transform: translateY(-1px); background: var(--accent-dark); }
 .neo-btn-full:active { box-shadow: var(--shadow-in); transform: translateY(0); }
 
 /* ── INPUTS ─────────────────────────────────────────────── */
@@ -707,6 +1066,7 @@ html, body {
 .neo-input::placeholder { color: var(--text-muted); }
 .neo-textarea { resize: vertical; min-height: 100px; }
 select.neo-input { cursor: pointer; }
+.neo-input:focus { background: rgba(255,255,255,0.5); }
 
 /* ── HERO ───────────────────────────────────────────────── */
 .hero {
@@ -716,21 +1076,19 @@ select.neo-input { cursor: pointer; }
 }
 .hero-eyebrow {
   display: inline-block;
-  background: var(--bg); box-shadow: var(--shadow-sm);
+  background: var(--accent); color: white;
   border-radius: 50px; padding: 0.3rem 1rem;
-  font-size: 0.8rem; font-weight: 500; color: var(--accent);
-  margin-bottom: 1.25rem; letter-spacing: 0.5px;
+  font-size: 0.78rem; font-weight: 600;
+  margin-bottom: 1.25rem; letter-spacing: 1px;
   text-transform: uppercase;
+  box-shadow: 0 4px 14px rgba(200,16,46,0.3);
 }
 .hero h1 {
   font-family: var(--font-display); font-size: clamp(2rem, 5vw, 3.5rem);
   font-weight: 700; line-height: 1.15; color: var(--text);
   margin-bottom: 1rem;
 }
-.hero h1 span {
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
-}
+.hero h1 span { color: var(--accent); }
 .hero p { color: var(--text-muted); font-size: 1.05rem; margin-bottom: 2rem; }
 
 /* ── SEARCH BAR ─────────────────────────────────────────── */
@@ -762,9 +1120,8 @@ select.neo-input { cursor: pointer; }
 }
 .filter-btn:hover { color: var(--accent); }
 .filter-btn.active {
-  color: white;
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
-  box-shadow: 0 4px 14px rgba(109,93,252,0.35);
+  color: white; background: var(--accent);
+  box-shadow: 0 4px 14px rgba(200,16,46,0.35);
 }
 
 /* ── LISTINGS GRID ──────────────────────────────────────── */
@@ -781,20 +1138,21 @@ select.neo-input { cursor: pointer; }
 /* ── CARDS ──────────────────────────────────────────────── */
 .listing-card {
   background: var(--bg); border-radius: var(--radius-card);
-  box-shadow: var(--shadow-out); overflow: hidden; cursor: pointer;
+  box-shadow: var(--shadow-card); overflow: hidden; cursor: pointer;
   transition: all var(--transition);
 }
-.listing-card:hover { transform: translateY(-4px); box-shadow: 12px 12px 24px #b0b6bf, -12px -12px 24px #ffffff; }
+.listing-card:hover { transform: translateY(-4px); box-shadow: 14px 14px 28px #b8b8b8, -14px -14px 28px #ffffff; }
 .listing-card:active { box-shadow: var(--shadow-in); transform: translateY(0); }
 .card-img-wrap { position: relative; overflow: hidden; height: 200px; }
 .card-img-wrap img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.4s ease; }
 .listing-card:hover .card-img-wrap img { transform: scale(1.04); }
 .type-badge {
   position: absolute; top: 12px; left: 12px;
-  background: rgba(255,255,255,0.92); backdrop-filter: blur(8px);
+  background: rgba(255,255,255,0.95);
   border-radius: 50px; padding: 0.25rem 0.75rem;
-  font-size: 0.75rem; font-weight: 600; color: var(--accent);
+  font-size: 0.75rem; font-weight: 700; color: var(--accent);
   display: inline-flex; align-items: center; gap: 0.3rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
 }
 .card-body { padding: 1.25rem; }
 .card-title { font-family: var(--font-display); font-size: 1.15rem; font-weight: 600; margin-bottom: 0.4rem; }
@@ -812,25 +1170,23 @@ select.neo-input { cursor: pointer; }
 /* ── LOADING ─────────────────────────────────────────────── */
 .loading-shimmer {
   height: 360px; border-radius: var(--radius-card);
-  background: linear-gradient(90deg, #d4d8e0 25%, #e0e5ec 50%, #d4d8e0 75%);
+  background: linear-gradient(90deg, #d8d8d8 25%, #e8e8e8 50%, #d8d8d8 75%);
   background-size: 200% 100%; animation: shimmer 1.5s infinite;
 }
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 .loading-text { color: var(--text-muted); text-align: center; padding: 2rem; }
-.empty-state {
-  text-align: center; padding: 4rem 2rem; color: var(--text-muted);
-}
+.empty-state { text-align: center; padding: 4rem 2rem; color: var(--text-muted); }
 .empty-state i { width: 56px; height: 56px; margin-bottom: 1rem; }
 .empty-state p { margin-bottom: 1.5rem; }
 
 /* ── LISTING DETAIL ──────────────────────────────────────── */
 .listing-detail { max-width: 1100px; margin: 0 auto; padding: 2rem; }
-.detail-gallery { margin-bottom: 2rem; border-radius: var(--radius-card); overflow: hidden; box-shadow: var(--shadow-out); }
+.detail-gallery { margin-bottom: 2rem; border-radius: var(--radius-card); overflow: hidden; box-shadow: var(--shadow-card); }
 .hero-img { width: 100%; height: 420px; object-fit: cover; display: block; }
 .thumb-row { display: flex; gap: 0.5rem; padding: 0.5rem; background: var(--bg); }
 .thumb-img { width: 120px; height: 80px; object-fit: cover; border-radius: 12px; cursor: pointer; box-shadow: var(--shadow-sm); }
 .detail-body { display: grid; grid-template-columns: 1fr 380px; gap: 2rem; }
-.type-badge-lg { font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+.type-badge-lg { font-size: 0.85rem; font-weight: 700; color: var(--accent); }
 .detail-title { font-family: var(--font-display); font-size: 2rem; font-weight: 700; margin: 0.5rem 0 1rem; line-height: 1.2; }
 .detail-desc { color: var(--text-muted); line-height: 1.7; margin-bottom: 1.5rem; }
 .amenities-section h3 { font-family: var(--font-display); font-size: 1.1rem; margin-bottom: 1rem; }
@@ -838,8 +1194,9 @@ select.neo-input { cursor: pointer; }
 .amenity-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; color: var(--text-muted); }
 .booking-card {
   background: var(--bg); border-radius: var(--radius-card);
-  box-shadow: var(--shadow-out); padding: 1.75rem; margin-bottom: 1rem;
+  box-shadow: var(--shadow-card); padding: 1.75rem; margin-bottom: 1rem;
   position: sticky; top: 90px;
+  border-top: 3px solid var(--accent);
 }
 .price-display { text-align: center; margin-bottom: 1.5rem; }
 .big-price { font-family: var(--font-display); font-size: 2.2rem; font-weight: 700; color: var(--accent); }
@@ -847,38 +1204,39 @@ select.neo-input { cursor: pointer; }
 .booking-form label { display: block; font-size: 0.82rem; font-weight: 600; margin: 0.85rem 0 0.35rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
 .host-card {
   background: var(--bg); border-radius: var(--radius-card);
-  box-shadow: var(--shadow-out); padding: 1.25rem;
+  box-shadow: var(--shadow-card); padding: 1.25rem;
   display: flex; align-items: center; gap: 1rem;
 }
 .error-msg { color: var(--danger); padding: 1rem; text-align: center; }
 
 /* ── DASHBOARD ───────────────────────────────────────────── */
-.dashboard-wrap { display: grid; grid-template-columns: 260px 1fr; min-height: calc(100vh - 72px); }
+.dashboard-wrap { display: grid; grid-template-columns: 270px 1fr; min-height: calc(100vh - 72px); }
 .dash-sidebar {
-  background: var(--bg); padding: 2rem 1.5rem;
-  box-shadow: 4px 0 20px rgba(0,0,0,0.04);
+  background: var(--text); padding: 2rem 1.5rem;
+  box-shadow: 4px 0 24px rgba(0,0,0,0.18);
 }
-.dash-profile { text-align: center; margin-bottom: 2rem; padding-bottom: 2rem; border-bottom: 1px solid rgba(0,0,0,0.06); }
+.dash-profile { text-align: center; margin-bottom: 2rem; padding-bottom: 2rem; border-bottom: 1px solid rgba(255,255,255,0.1); }
 .avatar-lg {
   width: 64px; height: 64px; border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  background: var(--accent);
   color: white; display: flex; align-items: center; justify-content: center;
   font-weight: 700; font-size: 1.4rem; margin: 0 auto 0.75rem;
-  box-shadow: var(--shadow-out);
+  box-shadow: 0 4px 16px rgba(200,16,46,0.5);
 }
-.dash-profile h3 { font-family: var(--font-display); font-size: 1.1rem; }
+.dash-profile h3 { font-family: var(--font-display); font-size: 1.1rem; color: white; }
+.dash-profile .text-muted { color: rgba(255,255,255,0.5); }
 .text-muted { color: var(--text-muted); font-size: 0.85rem; }
-.dash-nav { display: flex; flex-direction: column; gap: 0.5rem; }
+.dash-nav { display: flex; flex-direction: column; gap: 0.4rem; }
 .dash-nav-item {
   display: flex; align-items: center; gap: 0.75rem;
   padding: 0.75rem 1rem; border-radius: var(--radius-btn);
   border: none; cursor: pointer; font-family: var(--font-body);
-  font-size: 0.9rem; font-weight: 500; color: var(--text-muted);
+  font-size: 0.88rem; font-weight: 500; color: rgba(255,255,255,0.6);
   background: transparent; transition: all var(--transition); text-align: left;
 }
-.dash-nav-item:hover { background: var(--bg); box-shadow: var(--shadow-sm); color: var(--text); }
-.dash-nav-item.active { background: var(--bg); box-shadow: var(--shadow-out); color: var(--accent); font-weight: 600; }
-.dash-content { padding: 2rem; overflow-y: auto; }
+.dash-nav-item:hover { background: rgba(255,255,255,0.08); color: white; }
+.dash-nav-item.active { background: var(--accent); color: white; font-weight: 600; box-shadow: 0 4px 14px rgba(200,16,46,0.4); }
+.dash-content { padding: 2rem; overflow-y: auto; background: var(--bg); }
 .dash-tab { display: none; }
 .dash-tab.active { display: block; }
 .dash-section-title {
@@ -886,9 +1244,19 @@ select.neo-input { cursor: pointer; }
   margin-bottom: 1.5rem; color: var(--text);
   display: flex; align-items: center; gap: 0.75rem;
 }
+.dash-section-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 1.5rem; flex-wrap: wrap; gap: 0.75rem;
+}
+.dash-section-header .dash-section-title { margin-bottom: 0; }
 .badge {
   background: var(--accent); color: white; border-radius: 50px;
   padding: 0.1rem 0.6rem; font-size: 0.75rem; font-family: var(--font-body);
+}
+.pending-alert {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  background: #fff3cd; color: #7c4d00; border-radius: 50px;
+  padding: 0.3rem 0.85rem; font-size: 0.8rem; font-weight: 600;
 }
 .dash-listing-list { display: flex; flex-direction: column; gap: 1rem; }
 .dash-listing-row {
@@ -902,12 +1270,95 @@ select.neo-input { cursor: pointer; }
 .dash-listing-info h4 { font-weight: 600; margin-bottom: 0.2rem; }
 .dash-listing-actions { display: flex; gap: 0.5rem; }
 .booking-icon { flex-shrink: 0; }
+
+/* ── STATUS BADGES ───────────────────────────────────────── */
 .status-badge {
+  display: inline-flex; align-items: center; gap: 0.3rem;
   padding: 0.25rem 0.8rem; border-radius: 50px;
-  font-size: 0.75rem; font-weight: 600; text-transform: capitalize;
+  font-size: 0.75rem; font-weight: 600; text-transform: capitalize; white-space: nowrap;
 }
-.status-badge.confirmed { background: #d4f5e6; color: #2ecc71; }
-.status-badge.pending { background: #fff3d4; color: #f5a623; }
+.status-badge.confirmed { background: #d4edda; color: #155724; }
+.status-badge.pending   { background: #fff3cd; color: #7c4d00; }
+.status-badge.rejected  { background: #f8d7da; color: #721c24; }
+.status-badge.cancelled { background: #e2e3e5; color: #383d41; }
+
+/* ── HOST BOOKING CARDS ──────────────────────────────────── */
+.bookings-filter-row {
+  display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1.25rem;
+}
+.bookings-filter-btn {
+  padding: 0.4rem 1rem; border-radius: 50px; border: none;
+  cursor: pointer; font-family: var(--font-body); font-size: 0.82rem;
+  font-weight: 500; color: var(--text-muted); background: var(--bg);
+  box-shadow: var(--shadow-sm); transition: all var(--transition);
+}
+.bookings-filter-btn:hover { color: var(--accent); }
+.bookings-filter-btn.active { background: var(--text); color: white; }
+.host-bookings-list { display: flex; flex-direction: column; gap: 1.25rem; }
+.host-booking-card {
+  background: var(--surface-white); border-radius: 18px;
+  box-shadow: var(--shadow-sm); overflow: hidden;
+  display: grid; grid-template-columns: 110px 1fr auto;
+  border-left: 4px solid transparent;
+  transition: all var(--transition);
+}
+.host-booking-card[data-status="pending"]   { border-left-color: #f0a500; }
+.host-booking-card[data-status="confirmed"] { border-left-color: #2e7d32; }
+.host-booking-card[data-status="rejected"]  { border-left-color: #c8102e; }
+.host-booking-card[data-status="cancelled"] { border-left-color: #9e9e9e; }
+.host-booking-card:hover { box-shadow: var(--shadow-out); transform: translateY(-2px); }
+.hbc-img-col { width: 110px; flex-shrink: 0; overflow: hidden; }
+.hbc-listing-img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.hbc-body { padding: 1rem 1.25rem; flex: 1; }
+.hbc-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; margin-bottom: 0.75rem; }
+.hbc-listing-title { font-weight: 700; font-size: 1rem; color: var(--text); margin-bottom: 0.2rem; }
+.hbc-guest { display: flex; align-items: center; gap: 0.35rem; font-size: 0.82rem; color: var(--text-muted); }
+.hbc-dates { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.hbc-date-block { display: flex; flex-direction: column; }
+.hbc-date-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 0.1rem; }
+.hbc-date-val { font-size: 0.88rem; font-weight: 600; color: var(--text); }
+.hbc-date-val.hbc-total { color: var(--accent); }
+.hbc-date-sep { color: var(--text-muted); }
+.hbc-created { font-size: 0.75rem; color: var(--text-muted); }
+.hbc-actions {
+  display: flex; flex-direction: column; gap: 0.5rem;
+  padding: 1rem; justify-content: center; flex-shrink: 0;
+}
+.hbc-btn {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.45rem 0.85rem; border-radius: 10px; border: none;
+  cursor: pointer; font-family: var(--font-body); font-size: 0.8rem;
+  font-weight: 600; white-space: nowrap; transition: all var(--transition);
+}
+.hbc-btn.confirm { background: #d4edda; color: #155724; }
+.hbc-btn.confirm:hover { background: #2e7d32; color: white; }
+.hbc-btn.reject  { background: #f8d7da; color: #721c24; }
+.hbc-btn.reject:hover  { background: #c8102e; color: white; }
+.hbc-btn.cancel  { background: #e2e3e5; color: #383d41; }
+.hbc-btn.cancel:hover  { background: #383d41; color: white; }
+
+/* ── EDIT LISTING ────────────────────────────────────────── */
+.edit-images-grid {
+  display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.5rem;
+}
+.edit-img-thumb {
+  position: relative; width: 110px; height: 85px; border-radius: 12px; overflow: hidden;
+  box-shadow: var(--shadow-sm); flex-shrink: 0;
+}
+.edit-img-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.edit-img-remove {
+  position: absolute; top: 4px; right: 4px; width: 24px; height: 24px;
+  background: rgba(200,16,46,0.9); border: none; border-radius: 50%;
+  cursor: pointer; color: white; display: flex; align-items: center; justify-content: center;
+  transition: all 0.15s ease;
+}
+.edit-img-remove:hover { background: var(--accent-dark); transform: scale(1.1); }
+.edit-img-primary {
+  position: absolute; bottom: 4px; left: 4px;
+  background: var(--accent); color: white; border-radius: 4px;
+  font-size: 0.65rem; font-weight: 700; padding: 1px 5px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
 
 /* ── ADD LISTING FORM ────────────────────────────────────── */
 .add-listing-form { max-width: 680px; }
@@ -918,8 +1369,9 @@ select.neo-input { cursor: pointer; }
   border-radius: 16px; box-shadow: var(--shadow-in);
   background: var(--bg); padding: 2.5rem; text-align: center;
   cursor: pointer; transition: all var(--transition); color: var(--text-muted);
+  border: 2px dashed rgba(200,16,46,0.2);
 }
-.upload-zone:hover { box-shadow: var(--shadow-out); }
+.upload-zone:hover { box-shadow: var(--shadow-out); border-color: rgba(200,16,46,0.4); }
 .upload-zone p { margin-top: 0.75rem; font-size: 0.9rem; }
 .progress-bar-wrap {
   margin-top: 1rem; height: 6px; border-radius: 50px;
@@ -927,7 +1379,7 @@ select.neo-input { cursor: pointer; }
 }
 .progress-bar-fill {
   height: 100%; width: 0; border-radius: 50px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-light));
+  background: var(--accent);
   transition: width 0.3s ease;
 }
 .uploaded-preview { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1rem; }
@@ -937,15 +1389,16 @@ select.neo-input { cursor: pointer; }
 /* ── MODAL ───────────────────────────────────────────────── */
 .modal-overlay {
   display: none; position: fixed; inset: 0;
-  background: rgba(0,0,0,0.2); backdrop-filter: blur(6px);
+  background: rgba(0,0,0,0.45); backdrop-filter: blur(6px);
   z-index: 1000; align-items: center; justify-content: center;
 }
 .modal-overlay.open { display: flex; }
 .modal-box {
   background: var(--bg); border-radius: var(--radius-card);
-  box-shadow: 20px 20px 40px #b0b6bf, -20px -20px 40px #ffffff;
+  box-shadow: 20px 20px 40px #b0b0b0, -20px -20px 40px #ffffff;
   padding: 2.5rem; width: 100%; max-width: 420px; position: relative;
   animation: modalIn 0.25s ease;
+  border-top: 4px solid var(--accent);
 }
 @keyframes modalIn { from { opacity:0; transform: scale(0.95) translateY(10px); } to { opacity:1; transform: scale(1) translateY(0); } }
 .modal-close {
@@ -956,7 +1409,7 @@ select.neo-input { cursor: pointer; }
   box-shadow: var(--shadow-sm); color: var(--text-muted);
   font-size: 1.1rem; transition: all var(--transition);
 }
-.modal-close:hover { box-shadow: var(--shadow-out); }
+.modal-close:hover { box-shadow: var(--shadow-out); color: var(--danger); }
 .modal-title { font-family: var(--font-display); font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; }
 .modal-sub { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.75rem; }
 .auth-tabs { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
@@ -966,15 +1419,16 @@ select.neo-input { cursor: pointer; }
   font-weight: 500; color: var(--text-muted); background: var(--bg);
   box-shadow: var(--shadow-sm); transition: all var(--transition);
 }
-.auth-tab.active { color: white; background: linear-gradient(135deg, var(--accent), var(--accent-light)); box-shadow: 0 4px 14px rgba(109,93,252,0.35); }
+.auth-tab.active { color: white; background: var(--accent); box-shadow: 0 4px 14px rgba(200,16,46,0.35); }
 .auth-field-group { margin-bottom: 1rem; }
 .auth-field-group label { display: block; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.35rem; color: var(--text-muted); }
 .auth-error {
-  background: #ffe0e0; color: var(--danger); border-radius: 10px;
+  background: #f8d7da; color: #721c24; border-radius: 10px;
   padding: 0.6rem 1rem; font-size: 0.85rem; margin-bottom: 1rem; display: none;
+  border-left: 3px solid var(--accent);
 }
 .divider { text-align: center; color: var(--text-muted); font-size: 0.85rem; margin: 1rem 0; position: relative; }
-.divider::before, .divider::after { content: ''; position: absolute; top: 50%; width: calc(50% - 20px); height: 1px; background: rgba(0,0,0,0.08); }
+.divider::before, .divider::after { content: ''; position: absolute; top: 50%; width: calc(50% - 20px); height: 1px; background: rgba(0,0,0,0.1); }
 .divider::before { left: 0; } .divider::after { right: 0; }
 .google-btn {
   width: 100%; display: flex; align-items: center; justify-content: center; gap: 0.75rem;
@@ -989,8 +1443,8 @@ select.neo-input { cursor: pointer; }
 /* ── TOAST ───────────────────────────────────────────────── */
 #toast-container { position: fixed; bottom: 2rem; right: 2rem; z-index: 9999; display: flex; flex-direction: column; gap: 0.5rem; }
 .toast {
-  background: var(--bg); border-radius: 14px;
-  box-shadow: var(--shadow-out); padding: 0.85rem 1.25rem;
+  background: var(--text); color: white; border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3); padding: 0.85rem 1.25rem;
   font-size: 0.9rem; font-weight: 500;
   transform: translateX(120%); transition: transform 0.3s ease;
   border-left: 4px solid var(--success); min-width: 220px;
@@ -1001,30 +1455,35 @@ select.neo-input { cursor: pointer; }
 
 /* ── FOOTER ──────────────────────────────────────────────── */
 .site-footer {
-  background: var(--bg); box-shadow: 0 -4px 20px rgba(0,0,0,0.04);
+  background: var(--text); color: white;
   padding: 3rem 2rem; margin-top: 2rem;
   display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 2rem;
 }
-.footer-brand .logo { font-size: 1.4rem; margin-bottom: 0.5rem; display: inline-block; }
-.footer-brand p { color: var(--text-muted); font-size: 0.85rem; max-width: 240px; }
-.footer-col h4 { font-weight: 600; margin-bottom: 0.75rem; font-size: 0.9rem; }
+.footer-brand .logo { font-size: 1.4rem; margin-bottom: 0.5rem; display: inline-block; color: white; }
+.footer-brand .logo::after { background: var(--accent); }
+.footer-brand p { color: rgba(255,255,255,0.5); font-size: 0.85rem; max-width: 240px; }
+.footer-col h4 { font-weight: 600; margin-bottom: 0.75rem; font-size: 0.9rem; color: white; }
 .footer-col ul { list-style: none; }
 .footer-col ul li { margin-bottom: 0.4rem; }
-.footer-col ul li a { color: var(--text-muted); text-decoration: none; font-size: 0.85rem; transition: color var(--transition); }
+.footer-col ul li a { color: rgba(255,255,255,0.5); text-decoration: none; font-size: 0.85rem; transition: color var(--transition); }
 .footer-col ul li a:hover { color: var(--accent); }
 .footer-bottom {
   text-align: center; padding: 1rem 2rem;
-  color: var(--text-muted); font-size: 0.8rem;
-  border-top: 1px solid rgba(0,0,0,0.06);
+  color: rgba(255,255,255,0.4); font-size: 0.8rem;
+  background: #0d0d0d;
+  border-top: 1px solid rgba(255,255,255,0.05);
 }
 
 /* ── RESPONSIVE ──────────────────────────────────────────── */
 @media (max-width: 900px) {
   .detail-body { grid-template-columns: 1fr; }
   .dashboard-wrap { grid-template-columns: 1fr; }
-  .dash-sidebar { padding: 1.5rem; }
+  .dash-sidebar { padding: 1.5rem; background: var(--text); }
   .dash-nav { flex-direction: row; flex-wrap: wrap; }
+  .dash-nav-item { flex: 1; min-width: 140px; }
   .site-footer { grid-template-columns: 1fr; }
+  .host-booking-card { grid-template-columns: 90px 1fr; }
+  .hbc-actions { flex-direction: row; flex-wrap: wrap; grid-column: 1/-1; padding: 0.75rem 1rem; border-top: 1px solid rgba(0,0,0,0.07); }
 }
 @media (max-width: 600px) {
   .topnav { padding: 0.75rem 1rem; }
@@ -1033,6 +1492,9 @@ select.neo-input { cursor: pointer; }
   .section-title { padding: 0 1rem; }
   .filter-row { padding: 0 1rem; }
   .form-row { grid-template-columns: 1fr; }
+  .host-booking-card { grid-template-columns: 1fr; }
+  .hbc-img-col { display: none; }
+  .hbc-dates { gap: 0.75rem; }
 }
 </style>
 </head>
